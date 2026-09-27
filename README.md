@@ -229,6 +229,25 @@ single most important safety property here. Never reuse an agent address after
 deregistering it — Hyperliquid prunes its nonce state and old signatures can be
 replayed.
 
+### A deposit funds spot, not perp
+
+This trips up nearly every first live run. A USDC deposit credits your **spot**
+balance; perp collateral is a separate balance and does not move on its own. An
+account can therefore hold funds and still refuse every order with
+`accountValue=0`. Move it across explicitly:
+
+```bash
+python -m hlperp doctor              # shows both balances and the ledger
+python -m hlperp funding             # USDC spot -> perp, full spot balance
+python -m hlperp funding --amount 5  # or a specific amount
+python -m hlperp funding --to-spot   # perp -> spot, to withdraw
+```
+
+`doctor` is the quickest way to tell the two cases apart: it prints
+`account value=...`, `spot USDC ...`, and the last few ledger entries (including
+transfer fees), and it tells you the fix when the perp balance is zero but spot
+is not.
+
 ### Hyperliquid constraints worth knowing
 
 - **Nonces** are per signer; the 100 highest are kept and must fall within
@@ -238,7 +257,8 @@ replayed.
 - **Tick/lot**: prices carry 5 significant figures and at most `6 − szDecimals`
   decimals; sizes round to `szDecimals`.
 - **Order types**: `ALO` (post-only), `IOC`, `GTC`, plus trigger/tpsl support in
-  the SDK (`bulk_orders(grouping="positionTpsl")`) which is on the roadmap here.
+  the SDK (`bulk_orders(grouping="positionTpsl")`), which the trader now uses for
+  brackets.
 
 ---
 

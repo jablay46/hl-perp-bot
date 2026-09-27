@@ -2,8 +2,9 @@
 
     python -m hlperp paper     # real data, simulated fills (default)
     python -m hlperp live      # real orders, requires HL_ALLOW_LIVE=true
-    python -m hlperp doctor    # connectivity and configuration report
+    python -m hlperp doctor    # connectivity, balances and configuration report
     python -m hlperp backtest  # offline replay of candles and funding
+    python -m hlperp funding   # move USDC spot <-> perp (deposits land in spot)
 """
 
 from __future__ import annotations
@@ -71,13 +72,60 @@ def cmd_doctor(cfg) -> int:
         ok = False
         print(f"market data  FAILED: {exc}")
     if cfg.account_address:
-        st = Account(cfg.network, cfg.account_address).state(cfg.coin)
+        acct = Account(cfg.network, cfg.account_address)
+        st = acct.state(cfg.coin)
         print(f"account      value={st.account_value} withdrawable={st.withdrawable} "
               f"position={st.position.side if st.position else 'flat'}")
+        spot = acct.spot_usdc()
+        print(f"spot USDC    {spot}")
+        if st.account_value <= 0 and spot <= 0:
+            print("             -> no perp balance and no spot USDC: nothing to trade")
+        elif st.account_value <= 0 and spot > 0:
+            print("             -> USDC is on the SPOT balance, not perp. Run:")
+            print(f"                python -m hlperp funding --amount {spot:.6f}")
+        for e in acct.recent_ledger(24 * 3_600_000)[-5:]:
+            d = e.get("delta", {})
+            print(f"ledger       {d.get('type')} token={d.get('token')} "
+                  f"amount={d.get('amount')} usdcValue={d.get('usdcValue')} fee={d.get('fee')}")
     else:
         print("account      (none configured, paper equity used)")
     print("result       " + ("OK" if ok else "PROBLEMS FOUND"))
     return 0 if ok else 1
+
+
+def cmd_funding(cfg, amount: float | None, to_perp: bool) -> int:
+    """Move USDC between the spot and perp balances of the same account.
+
+    A Hyperliquid deposit credits the *spot* balance; it does not become perp
+    collateral on its own, which is why an account can show funds and still be
+    unable to place an order. This is the missing step.
+    """
+    if not cfg.signing_key:
+        print("funding needs a key (HL_AGENT_PRIVATE_KEY or HL_PRIVATE_KEY)", file=sys.stderr)
+        return 2
+    from eth_account import Account as EthAccount
+    from hyperliquid.exchange import Exchange
+
+    if amount is None:
+        if to_perp:
+            amount = Account(cfg.network, cfg.account_address).spot_usdc()
+        else:
+            amount = Account(cfg.network, cfg.account_address).perp_usdc()
+    if amount <= 0:
+        print(f"nothing to transfer (amount={amount})", file=sys.stderr)
+        return 1
+
+    wallet = EthAccount.from_key(cfg.signing_key)
+    exchange = Exchange(wallet, base_url=cfg.base_url, account_address=cfg.account_address)
+    direction = "spot -> perp" if to_perp else "perp -> spot"
+    print(f"transferring {amount} USDC {direction} for {cfg.account_address}")
+    res = exchange.usd_class_transfer(amount, to_perp)
+    print(res)
+    if str(res.get("status")) != "ok":
+        return 1
+    acct = Account(cfg.network, cfg.account_address)
+    print(f"after: perp={acct.perp_usdc()} spot={acct.spot_usdc()}")
+    return 0
 
 
 def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
@@ -164,11 +212,16 @@ def cmd_backtest(cfg, interval: str, hours: float) -> int:
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     parser = argparse.ArgumentParser(prog="hl-perp-bot")
-    parser.add_argument("command", choices=["paper", "live", "doctor", "backtest"],
+    parser.add_argument("command",
+                        choices=["paper", "live", "doctor", "backtest", "funding"],
                         nargs="?", default="paper")
     parser.add_argument("--seconds", type=float, default=None, help="run for this long then exit")
     parser.add_argument("--interval", default="1m", help="backtest candle interval")
     parser.add_argument("--hours", type=float, default=6.0, help="backtest lookback in hours")
+    parser.add_argument("--amount", type=float, default=None,
+                        help="funding: USDC amount, defaults to the full source balance")
+    parser.add_argument("--to-spot", action="store_true",
+                        help="funding: move perp -> spot instead of spot -> perp")
     args = parser.parse_args(argv)
 
     try:
@@ -181,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(cfg)
     if args.command == "backtest":
         return cmd_backtest(cfg, args.interval, args.hours)
+    if args.command == "funding":
+        return cmd_funding(cfg, args.amount, to_perp=not args.to_spot)
     override = "live" if args.command == "live" else "paper"
     return cmd_run(cfg, override, args.seconds)
 

@@ -7,6 +7,7 @@ can run without a key.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from hyperliquid.info import Info
@@ -89,6 +90,41 @@ class Account:
             return self.info.user_fills_by_time(self.address, start_ms)
         except Exception as exc:  # pragma: no cover - network
             log.warning("user_fills_by_time failed: %s", exc)
+            return []
+
+    def perp_usdc(self) -> float:
+        """Transferable perp balance. Zero means no perp order can be placed."""
+        if not self.address:
+            return self.paper_equity
+        try:
+            raw = self.info.user_state(self.address)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("perp balance check failed: %s", exc)
+            return 0.0
+        return float(raw.get("withdrawable", 0.0) or 0.0)
+
+    def spot_usdc(self) -> float:
+        """Spot USDC balance. Deposits land here and must be moved to perp."""
+        if not self.address:
+            return 0.0
+        try:
+            raw = self.info.spot_user_state(self.address)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("spot balance check failed: %s", exc)
+            return 0.0
+        for b in raw.get("balances", []):
+            if b.get("coin") == "USDC":
+                return float(b.get("total", 0.0) or 0.0)
+        return 0.0
+
+    def recent_ledger(self, lookback_ms: int) -> list[dict]:
+        if not self.address:
+            return []
+        start = int(time.time() * 1000) - lookback_ms
+        try:
+            return self.info.user_non_funding_ledger_updates(self.address, start)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("ledger fetch failed: %s", exc)
             return []
 
     def _paper_state(self, coin: str) -> AccountState:

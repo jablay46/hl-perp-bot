@@ -35,6 +35,7 @@ PYTHONPATH=src python -m pytest -q
 PYTHONPATH=src python -m hlperp doctor
 PYTHONPATH=src python -m hlperp paper --seconds 30
 PYTHONPATH=src python -m hlperp backtest --interval 1m --hours 6
+PYTHONPATH=src python -m hlperp funding            # USDC spot -> perp
 ```
 
 There is no test config; tests import `hlperp` from `src`, so `PYTHONPATH=src`
@@ -60,6 +61,10 @@ is required (or install the package editable).
   PnL.
 - **Brackets are grouped `positionTpsl`**, reduce-only, armed only when position
   size changes, with the stop clamped strictly inside liquidation.
+- **A deposit lands on the spot balance, not perp collateral.** An account can
+  hold USDC and still refuse every order with `accountValue=0`. The fix is an
+  explicit `usd_class_transfer` (`python -m hlperp funding`). `doctor` prints both
+  balances and the ledger so this is visible before a live run.
 
 ## Gotchas
 
