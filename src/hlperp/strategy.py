@@ -134,22 +134,24 @@ class Strategy:
         assert mid is not None
         half = self.cfg.spread_bps / 10_000
         if self.cfg.order_tif == "ALO":
-            # Rest inside the spread, never crossing. "Inside" is:
-            #   buy  -> above the best bid, at or below mid
-            #   sell -> below the best ask, at or above mid
-            offset = mid * half
+            # Join the near touch on our own side: the best bid for a buy, the
+            # best ask for a sell. It is maker (post-only) and, unlike quoting at
+            # the mid, it still rests when the spread is a single tick; best levels
+            # are already tick-valid so rounding cannot push us across.
+            # `spread_bps` only widens the quote when there is room to.
+            half = self.cfg.spread_bps / 10_000
             if side == "buy":
-                px = mid - offset
-                if book.best_bid is not None and px < book.best_bid:
-                    px = book.best_bid  # spread too tight: join the bid
+                px = mid - mid * half
+                if book.best_bid is not None:
+                    px = max(px, book.best_bid)  # never behind the bid
                 if book.best_ask is not None and px >= book.best_ask:
-                    px = book.best_bid or mid
+                    px = book.best_bid if book.best_bid is not None else px
             else:
-                px = mid + offset
-                if book.best_ask is not None and px > book.best_ask:
-                    px = book.best_ask  # spread too tight: join the ask
+                px = mid + mid * half
+                if book.best_ask is not None:
+                    px = min(px, book.best_ask)  # never through the ask
                 if book.best_bid is not None and px <= book.best_bid:
-                    px = book.best_ask or mid
+                    px = book.best_ask if book.best_ask is not None else px
             px = round_px(px, sz_decimals)
             tif = "ALO"
         else:

@@ -79,8 +79,9 @@ perp accounts (funding and liquidation) modelled rather than ignored.
 | `risk.py` | sizing, liquidation maths, drawdown kill-switch |
 | `execution.py` | `LiveBroker` and `PaperBroker` behind one interface |
 | `trader.py` | the loop and P&L (fees, funding, realized, unrealized) |
+| `backtest.py` | offline candle + funding replay through the same strategy |
 | `server.py` | stdlib dashboard: snapshot, `/events` SSE, single page |
-| `cli.py` | `paper` / `live` / `doctor` entry points |
+| `cli.py` | `paper` / `live` / `doctor` / `backtest` entry points |
 
 ---
 
@@ -94,9 +95,11 @@ perp accounts (funding and liquidation) modelled rather than ignored.
 3. **Ask** the model for `P(mid higher after horizon)`. Above 0.5 is long.
 4. **Size** through the risk engine (see below). A denial is recorded, not
    traded around.
-5. **Quote.** With `HL_ORDER_TIF=ALO`, place a post-only limit inside the spread
-   on the model's side and cancel the previous one, so the bot earns the maker
-   fee instead of paying the taker fee. With `IOC`, cross the touch.
+5. **Quote.** With `HL_ORDER_TIF=ALO`, place a post-only limit that joins the near
+   touch on the model's side (best bid for a buy, best ask for a sell) and cancel
+   the previous one, so the bot earns the maker fee instead of paying the taker
+   fee and still rests when the spread is a single tick. With `IOC`, cross the
+   touch.
 6. **Account.** Maker fills arrive from the exchange (live) or from the trade
    tape (paper). Fees are charged per fill; funding accrues on open notional at
    the hourly rate. Both show up in the dashboard P&L.
@@ -106,8 +109,11 @@ perp accounts (funding and liquidation) modelled rather than ignored.
 This is the layer the original has no equivalent of. It runs *between* the model
 and the exchange.
 
-- **Sizing.** `notional = equity * risk_pct * leverage`, capped by
-  `max_notional_pct` of equity.
+- **Sizing is a target, not a per-tick order.** The target notional is
+  `equity * risk_pct * leverage`, capped by `max_notional_pct` of equity, and the
+  order is sized as the *delta* from the position already held. A repeat tick
+  with an unchanged signal therefore does not stack a new position, and a flip
+  from long to short sizes the full distance through flat.
 - **Liquidation distance.** Uses the Hyperliquid formula:
 
   ```
@@ -116,10 +122,38 @@ and the exchange.
       side = +1 long, -1 short
   ```
 
-  An order whose liquidation would sit closer than `min_liq_distance_pct` is
-  refused. This is the guard that matters most on a leveraged book.
+  For a fixed leverage the distance collapses to `(1/lev) / (1 - 1/L)`, which is
+  what the engine checks against `min_liq_distance_pct`. `L` is
+  `HL_MAINTENANCE_LEVERAGE`, deliberately separate from the exchange's *max*
+  leverage — a 10x position is only about 5.6% from liquidation at 10x
+  maintenance, not the 10% you would get by assuming `L = max_leverage`.
 - **Kill-switch.** Peak-to-trough drawdown past `max_drawdown_pct` halts trading
   and cancels every resting order.
+
+### Take-profit / stop-loss
+
+With `HL_TP_SL=true`, once a position reaches its target size the trader arms a
+reduce-only bracket around the mark. Live mode sends both legs as one grouped
+`positionTpsl` request, so when one fires the venue cancels the sibling instead
+of leaving a naked stop behind. The stop trigger is clamped to stay strictly
+inside the liquidation price, because a stop beyond liquidation would never
+fire. Paper mode simulates the same triggers against the trade tape.
+
+### Reconciling live fills
+
+The order acknowledgement is not the source of truth for live P&L. Each tick in
+live mode polls `user_fills_by_time` and folds unseen fills into the totals,
+keyed by `(time, oid, hash)` so a repeated poll cannot double count. That is what
+supplies the real fee (net of any maker rebate) and the realised closed PnL.
+
+### Backtesting
+
+`python -m hlperp backtest --interval 1m --hours 24` replays candles and funding
+history through the same model, risk engine and fee model, entirely offline
+apart from the one historical fetch. A maker order quoted on one candle is
+checked against the next candle's range, funding is charged at the historical
+hourly rate, and the report includes return, max drawdown and win rate. It is
+deliberately conservative: no fill is assumed better than the quote.
 
 ### Funding, accounted honestly
 
@@ -163,8 +197,12 @@ python -m hlperp paper --seconds 60    # bounded run, useful for CI/smoke
 | `HL_ORDER_TIF` | `ALO` | `ALO` post-only maker, `IOC` taker, `GTC` resting |
 | `HL_SPREAD_BPS` | `2.0` | how far inside the touch to quote |
 | `HL_RISK_PCT` | `0.01` | fraction of equity risked per trade |
+| `HL_MAINTENANCE_LEVERAGE` | `2.0` | maintenance-margin assumption for liq distance |
 | `HL_MAX_DRAWDOWN_PCT` | `10` | kill-switch threshold |
 | `HL_MIN_LIQ_DISTANCE_PCT` | `15` | refuse orders with liquidation closer than this |
+| `HL_TP_SL` | `false` | arm a reduce-only take-profit / stop-loss bracket |
+| `HL_TP_PCT` / `HL_SL_PCT` | `0.02` / `0.01` | bracket distances from the mark |
+| `HL_INTERVAL` | `2.0` | seconds between decisions |
 | `HL_MODEL` | `momentum` | `momentum` stand-in or `openai` |
 
 ---
@@ -210,16 +248,16 @@ replayed.
 PYTHONPATH=src python -m pytest -q
 ```
 
-24 tests cover tick/lot rounding, the config interlock, liquidation maths and
-the kill-switch, paper matching and fee accounting, and a deterministic
-end-to-end loop (decision → risk → order → fill → P&L).
+37 tests cover tick/lot rounding, the config interlock, liquidation maths, delta
+sizing and the kill-switch, paper matching (partial fills, TP/SL triggers) and
+fee accounting, live-fill reconciliation idempotence, the offline backtester, and
+a deterministic end-to-end loop (decision → risk → order → fill → P&L).
 
 ---
 
 ## Roadmap (what a real strategy still needs)
 
-- Backtest and walk-forward validation on historical candles and funding.
-- Grouped TP/SL triggers armed at fill time (`positionTpsl`).
+- Walk-forward validation and parameter sweeps on top of the backtester.
 - A funding/basis model, not just a momentum stand-in.
 - Per-asset margin tiers rather than a single maintenance-leverage approximation.
 - Reconnect reconciliation against `openOrders`/`clearinghouseState`.

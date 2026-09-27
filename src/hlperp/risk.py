@@ -28,6 +28,7 @@ class RiskDecision:
     allowed: bool
     size: float
     reason: str
+    side: str = ""
     notional: float = 0.0
     liq_distance_pct: Optional[float] = None
 
@@ -81,43 +82,97 @@ class RiskEngine:
         self.halt_reason = ""
 
     # -- order level -------------------------------------------------------
+    def required_distance_pct(self, leverage: float) -> float:
+        """The liquidation distance implied by a leverage, as a percentage of price.
+
+        Isolated margin, maintenance leverage ``L`` and entry leverage ``lev``:
+
+            liq_price = entry * (1 - side * (1/lev) / (1 - side/L))
+
+        so the distance ``|entry - liq| / entry`` is ``(1/lev) / (1 - 1/L)``, which
+        is independent of size. A 10x position with 10x maintenance therefore sits
+        about 5.6% from liquidation; an isolated 40x one is under 1.3% away.
+        """
+        if leverage <= 0:
+            return 0.0
+        l = 1.0 / self.cfg.maintenance_leverage
+        if l >= 1.0:
+            return 0.0
+        return (1.0 / leverage) / (1.0 - l) * 100.0
+
     def size(
         self,
         side: str,
         equity: float,
         px: float,
-        maintenance_leverage: float,
+        exchange_max_leverage: float,
         current_position: Optional[object] = None,
     ) -> RiskDecision:
-        """Size a new exposure. ``side`` is buy|sell (the direction of the order)."""
+        """Size the next order as the delta toward a target exposure.
+
+        ``side`` is the requested direction (buy|sell). The target notional is
+        ``equity * risk_pct * leverage``, capped by ``max_notional_pct`` of equity,
+        and clipped so we never request more than the exchange's max leverage
+        allows. The returned size is the *difference* from the position already
+        held, so repeat ticks with an unchanged model do not stack.
+        """
         if self.check_kill_switch(equity):
             return RiskDecision(False, 0.0, f"halted: {self.halt_reason}")
         if px <= 0:
             return RiskDecision(False, 0.0, "no price")
 
-        risk_usd = equity * self.cfg.risk_pct
-        notional = risk_usd * self.cfg.leverage
+        direction = 1.0 if side == "buy" else -1.0
 
-        # Hard cap: never let one position exceed a fraction of equity.
-        max_notional = equity * (self.cfg.max_notional_pct / 100.0)
-        notional = min(notional, max_notional)
+        # The mainnet maintenance margin is not 1 / max leverage; using max
+        # leverage here would let a position size through that the book cannot
+        # support. Refuse to trade if our maintenance assumption is inconsistent.
+        if self.cfg.leverage > exchange_max_leverage:
+            return RiskDecision(
+                False, 0.0,
+                f"HL_LEVERAGE={self.cfg.leverage} exceeds the exchange max {exchange_max_leverage:g} for this coin",
+            )
 
-        size = notional / px
-        if size <= 0:
+        target_notional = equity * self.cfg.risk_pct * self.cfg.leverage
+        target_notional = min(target_notional, equity * self.cfg.max_notional_pct / 100.0)
+        if target_notional <= 0:
             return RiskDecision(False, 0.0, "sized to zero")
 
-        # Liquidation distance: refuse exposure whose liquidation sits closer
-        # than the configured floor, which is what actually kills accounts.
-        margin_available = notional / self.cfg.leverage
-        liq = liquidation_price(px, size, "long" if side == "buy" else "short", margin_available, maintenance_leverage)
-        if liq is not None:
-            dist = abs(px - liq) / px * 100.0
-            if dist < self.cfg.min_liq_distance_pct:
-                return RiskDecision(
-                    False, 0.0, f"liquidation only {dist:.1f}% away (< {self.cfg.min_liq_distance_pct}%)",
-                    notional=notional, liq_distance_pct=dist,
-                )
-        else:
-            dist = None
+        cur_signed = self._signed_notional(current_position)
+        delta = direction * target_notional - cur_signed
+        if abs(delta) < 1e-12:
+            return RiskDecision(False, 0.0, "already at target exposure")
 
-        return RiskDecision(True, size, "ok", notional=notional, liq_distance_pct=dist)
+        order_side = "buy" if delta > 0 else "sell"
+        size = abs(delta) / px
+        resulting_notional = abs(cur_signed + delta)
+        # Resulting margin must fit inside equity at the requested leverage.
+        if resulting_notional / self.cfg.leverage > equity:
+            return RiskDecision(
+                False, 0.0,
+                f"resulting margin {resulting_notional / self.cfg.leverage:.2f} exceeds equity {equity:.2f}",
+                notional=resulting_notional,
+            )
+
+        dist = self.required_distance_pct(self.cfg.leverage)
+        if dist and dist < self.cfg.min_liq_distance_pct:
+            return RiskDecision(
+                False, 0.0,
+                f"liquidation distance at {self.cfg.leverage}x is {dist:.1f}% "
+                f"(< {self.cfg.min_liq_distance_pct}%)",
+                notional=resulting_notional, liq_distance_pct=dist,
+            )
+
+        return RiskDecision(True, size, "ok", side=order_side,
+                            notional=abs(delta), liq_distance_pct=dist)
+
+    @staticmethod
+    def _signed_notional(position: Optional[object]) -> float:
+        if position is None:
+            return 0.0
+        value = abs(float(getattr(position, "position_value", 0.0) or 0.0))
+        side = getattr(position, "side", "flat")
+        if side == "long":
+            return value
+        if side == "short":
+            return -value
+        return 0.0

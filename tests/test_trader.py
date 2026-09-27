@@ -1,10 +1,3 @@
-"""Integration test for the trader loop using fakes for market and account.
-
-Deterministic: real market data is not needed to prove that a decision flows
-through risk sizing into an order, and that a crossing print fills a resting
-maker order and moves P&L.
-"""
-
 from __future__ import annotations
 
 import time
@@ -12,10 +5,9 @@ import time
 from hlperp.account import Account
 from hlperp.config import load_config
 from hlperp.execution import PaperBroker
-from hlperp.market import MarketData
 from hlperp.model import MomentumModel
 from hlperp.trader import Trader
-from hlperp.types import AssetCtx, Book, Level, TradePrint
+from hlperp.types import AssetCtx, Book, Level, Signal, TradePrint
 
 
 class FakeMarket:
@@ -54,9 +46,10 @@ def test_tick_produces_decision_and_order(monkeypatch):
     assert e is not None
     assert e.decision is not None
     assert e.order is not None
-    # ALO must rest inside the touch, never crossing.
+    # ALO must rest at the near touch, never crossing.
     assert e.order["status"] == "resting"
     assert e.order["px"] < market.book.best_ask
+    assert e.order["px"] >= market.book.best_bid
     assert len(events) == 1
 
 
@@ -69,16 +62,33 @@ def test_crossing_print_fills_resting_maker_and_updates_pnl(monkeypatch):
     trader.tick()
     assert len(broker.open_orders("BTC")) == 1
     resting = broker.open_orders("BTC")[0]
-    # A seller hits our resting bid.
-    trader.on_print("BTC", resting.px - 0.01, int(time.time() * 1000), is_buy=False)
-    assert trader.totals["fills"] == 1
+    # A seller hits our resting bid: a market sell print at our price.
+    n_before = trader.totals["fills"]
+    trader.on_print("BTC", resting.px, int(time.time() * 1000), is_buy=False)
+    assert trader.totals["fills"] > n_before
     assert trader.totals["fees"] > 0
     assert broker.position("BTC").size > 0
 
 
+def test_wrong_side_print_does_not_fill(monkeypatch):
+    """A print that does not reach our resting bid must not fill it."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    trader.tick()
+    resting = broker.open_orders("BTC")[0]
+    # A print above our resting bid never fills a bid.
+    trader.on_print("BTC", resting.px + 1.0, int(time.time() * 1000), is_buy=True)
+    assert trader.totals["fills"] == 0
+    assert broker.position("BTC").size == 0
+
+
 def test_risk_blocks_order_when_liquidation_too_close(monkeypatch):
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_LEVERAGE=10,
-               HL_MAX_LEVERAGE=10, HL_MIN_LIQ_DISTANCE_PCT=15, HL_MAX_DRAWDOWN_PCT=99)
+               HL_MAX_LEVERAGE=10, HL_MAINTENANCE_LEVERAGE=10,
+               HL_MIN_LIQ_DISTANCE_PCT=15, HL_MAX_DRAWDOWN_PCT=99)
     market = FakeMarket()
     broker = PaperBroker("BTC")
     trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
@@ -117,3 +127,67 @@ def test_funding_accrues_on_open_position(monkeypatch):
     trader._last_funding_ts -= 3_600_000  # simulate an hour passing
     trader.tick()
     assert trader.totals["funding"] > 0
+
+
+class FakeLiveAccount(Account):
+    """Account stub that returns a controlled fill log for reconciliation."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.address = "0xabc"
+
+    def fills(self, start_ms):
+        return [r for r in self.rows if r["time"] >= start_ms]
+
+
+def _live_trader(cfg, rows):
+    return Trader(cfg, FakeMarket(), FakeLiveAccount(rows), PaperBroker("BTC"), MomentumModel())
+
+
+def test_reconcile_fills_is_idempotent(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_MIN_LIQ_DISTANCE_PCT=0,
+               HL_MAX_DRAWDOWN_PCT=99)
+    rows = [{"time": int(time.time() * 1000), "oid": 1, "hash": "0x1", "coin": "BTC",
+             "side": "B", "px": 100.0, "sz": 0.5, "fee": 0.01, "closedPnl": 0.0,
+             "crossed": True}]
+    trader = _live_trader(cfg, rows)
+    first = trader.reconcile_fills()
+    assert len(first) == 1 and trader.totals["fills"] == 1
+    # A second poll of the same rows must not double count.
+    assert trader.reconcile_fills() == []
+    assert trader.totals["fills"] == 1
+    assert abs(trader.totals["fees"] - 0.01) < 1e-12
+
+
+def test_reconcile_ignores_other_coins(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_MIN_LIQ_DISTANCE_PCT=0,
+               HL_MAX_DRAWDOWN_PCT=99)
+    rows = [{"time": int(time.time() * 1000), "oid": 1, "hash": "0x2", "coin": "ETH",
+             "side": "B", "px": 10.0, "sz": 1.0, "fee": 0.0, "closedPnl": 0.0,
+             "crossed": True}]
+    trader = _live_trader(cfg, rows)
+    assert trader.reconcile_fills() == []
+    assert trader.totals["fills"] == 0
+
+
+def test_arm_bracket_places_and_does_not_churn(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_TP_SL="true",
+               HL_TP_PCT=0.02, HL_SL_PCT=0.01, HL_MIN_LIQ_DISTANCE_PCT=0,
+               HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    # Open a long at the mark, then arm a bracket around it.
+    broker.place(Signal("BTC", "buy", "IOC", 100.1), 1.0, 100.1, 2)
+    state = Account("testnet", None).state("BTC")
+    trader.arm_bracket(state)
+    legs = broker._brackets.get("BTC")
+    assert legs and len(legs) == 2
+    tp = next(l.px for l in legs if l.kind == "tp")
+    sl = next(l.px for l in legs if l.kind == "sl")
+    assert tp > 100.1 and sl < 100.1
+    # Re-arming with an unchanged size must not churn the bracket.
+    before = list(broker._brackets["BTC"])
+    trader.arm_bracket(state)
+    assert [l.px for l in broker._brackets["BTC"]] == [l.px for l in before]
+

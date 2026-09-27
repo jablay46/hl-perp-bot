@@ -24,7 +24,7 @@ from .market import MarketData
 from .model import Model
 from .risk import RiskEngine
 from .strategy import Strategy
-from .types import AccountState, Fill, MarketState, OrderResult
+from .types import AccountState, Fill, MarketState, OrderResult, Position
 
 log = logging.getLogger("hlperp.trader")
 
@@ -78,6 +78,11 @@ class Trader:
         self._last_funding_ts = int(time.time() * 1000)
         self._stop = False
         self.base_equity = 10_000.0
+        # Live fill reconciliation state.
+        self._seen_fills: set[tuple] = set()
+        self._last_fill_ts = int(time.time() * 1000) - 60_000
+        # Bracket state: the position size we last armed a TP/SL for.
+        self._bracket_size = 0.0
 
     # -- market callbacks --------------------------------------------------
     def on_print(self, coin: str, px: float, ts: int, is_buy: bool) -> None:
@@ -94,6 +99,82 @@ class Trader:
             "FILL %s %s %.6f@%.2f fee=%.4f closed=%.4f%s",
             f.coin, f.side, f.sz, f.px, f.fee, f.closed_pnl, "" if f.crossed else " (maker)",
         )
+
+    # -- live fill reconciliation -----------------------------------------
+    def reconcile_fills(self) -> list[Fill]:
+        """Pull the exchange's own fill log and fold unseen fills into totals.
+
+        The REST response is the source of truth for live P&L: it carries the
+        actual fee (already net of the maker rebate) and the closed PnL, neither
+        of which can be read off the order acknowledgement. Fills are keyed by
+        (time, oid, hash) so a repeated poll does not double count.
+        """
+        rows = self.account.fills(self._last_fill_ts)
+        out: list[Fill] = []
+        for r in rows:
+            ts = int(r.get("time", 0))
+            oid = int(r.get("oid", 0) or 0)
+            key = (ts, oid, str(r.get("hash", "")))
+            if key in self._seen_fills:
+                continue
+            self._seen_fills.add(key)
+            if ts > self._last_fill_ts:
+                self._last_fill_ts = ts
+            fill = Fill(
+                coin=r.get("coin", self.cfg.coin),
+                side="buy" if r.get("side") == "B" else "sell",
+                px=float(r.get("px", 0.0)),
+                sz=float(r.get("sz", 0.0)),
+                fee=float(r.get("fee", 0.0)),
+                closed_pnl=float(r.get("closedPnl", 0.0)),
+                ts=ts,
+                oid=oid,
+                crossed=bool(r.get("crossed", False)),
+                hash=str(r.get("hash", "")),
+            )
+            if fill.coin != self.cfg.coin:
+                continue
+            self._apply_fill(fill)
+            out.append(fill)
+        return out
+
+    # -- take-profit / stop-loss ------------------------------------------
+    def arm_bracket(self, state: AccountState) -> None:
+        """Arm reduce-only TP/SL triggers once the position reaches its target.
+
+        Trigger prices are clamped inside the liquidation price so the stop cannot
+        sit beyond liquidation, where it would never fire. Re-armed only when the
+        position size changes, so a resting bracket is not churned every tick.
+        """
+        if not self.cfg.tp_sl_enabled or not self.broker.supports_brackets:
+            return
+        pos, _ = self._position_view(state)
+        if pos is None or pos.size <= 0:
+            if self._bracket_size:
+                self.broker.cancel_brackets(self.cfg.coin)
+                self._bracket_size = 0.0
+            return
+        if abs(pos.size - self._bracket_size) <= 1e-9:
+            return
+        mark = self.market.ctx.mark_px if self.market.ctx else pos.entry_px
+        long = pos.side == "long"
+        buf = self.cfg.trigger_buffer_bps / 10_000
+        tp = mark * ((1 + self.cfg.tp_pct) if long else (1 - self.cfg.tp_pct))
+        sl = mark * ((1 - self.cfg.sl_pct) if long else (1 + self.cfg.sl_pct))
+        # Keep the stop strictly inside liquidation; a stop past it never triggers.
+        liq = pos.liquidation_px
+        if liq is not None:
+            sl = max(sl, liq * (1 + buf)) if long else min(sl, liq * (1 - buf))
+        # Both triggers must be on the correct side of the live mark.
+        if long:
+            tp = max(tp, mark * (1 + buf))
+            sl = min(sl, mark * (1 - buf))
+        else:
+            tp = min(tp, mark * (1 - buf))
+            sl = max(sl, mark * (1 + buf))
+        self.broker.cancel_brackets(self.cfg.coin)
+        ok = self.broker.place_bracket(self.cfg.coin, long, pos.size, tp, sl)
+        self._bracket_size = pos.size if ok else 0.0
 
     # -- funding -----------------------------------------------------------
     def _accrue_funding(self, state: AccountState, ctx) -> None:
@@ -118,13 +199,21 @@ class Trader:
             p = self.broker.position(self.cfg.coin)
             if p.size == 0:
                 return None, 0.0
-            side = "long" if p.size > 0 else "short"
             mark = self.market.ctx.mark_px if self.market.ctx else p.entry_px
-            dummy = type("P", (), {"side": side, "size": abs(p.size), "entry_px": p.entry_px,
-                                   "position_value": abs(p.size) * mark, "unrealized_pnl": 0.0,
-                                   "margin_used": 0.0, "liquidation_px": None, "leverage": self.cfg.leverage,
-                                   "leverage_type": "paper"})()
-            return dummy, abs(p.size) * mark
+            value = abs(p.size) * mark
+            pos = Position(
+                coin=self.cfg.coin,
+                side="long" if p.size > 0 else "short",
+                size=abs(p.size),
+                entry_px=p.entry_px,
+                position_value=value,
+                unrealized_pnl=self.broker.unrealized(self.cfg.coin, mark),
+                margin_used=value / max(1, self.cfg.leverage),
+                liquidation_px=None,
+                leverage=float(self.cfg.leverage),
+                leverage_type="paper",
+            )
+            return pos, value
         if state.position is None:
             return None, 0.0
         return state.position, state.position.position_value
@@ -148,6 +237,9 @@ class Trader:
         # Recompute after funding so the kill switch sees the true equity.
         equity = self._equity(state, ctx.mark_px)
         self.totals["last_equity"] = equity
+        if not isinstance(self.broker, PaperBroker):
+            self.reconcile_fills()
+        self.arm_bracket(state)
 
         halted = self.risk.check_kill_switch(equity)
         if halted:
@@ -191,16 +283,25 @@ class Trader:
                 "buy" if action == "buy" else "sell",
                 self.totals["last_equity"],
                 sig.limit_px,
-                maintenance_leverage=self.market.max_leverage,
-                current_position=state.position,
+                exchange_max_leverage=self.market.max_leverage,
+                current_position=pos_view,
             )
             if size_dec.allowed:
+                # The risk engine may flip the side (e.g. an existing long that
+                # needs unwinding); honour the order it actually wants.
+                order_side = size_dec.side or ("buy" if action == "buy" else "sell")
+                if order_side != ("buy" if action == "buy" else "sell"):
+                    sig = self.strategy.signal_for(order_side, book, self.market.sz_decimals)
                 self._cancel_resting()
                 result = self.broker.place(sig, size_dec.size, book.mid, self.market.sz_decimals)
                 self.totals["orders"] += 1
                 if result.status in ("rejected", "error"):
                     self.totals["rejected"] += 1
                 order_dict = asdict(result)
+                order_dict["risk"] = {
+                    "notional": round(size_dec.notional, 2),
+                    "liq_distance_pct": size_dec.liq_distance_pct,
+                }
                 if result.status == "filled" and result.raw.get("fill"):
                     self._apply_fill(Fill(**result.raw["fill"]))
             else:

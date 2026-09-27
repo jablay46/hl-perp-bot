@@ -1,8 +1,9 @@
 """Command line entry point.
 
-    python -m hlperp.cli paper     # real data, simulated fills (default)
-    python -m hlperp.cli live      # real orders, requires HL_ALLOW_LIVE=true
-    python -m hlperp.cli doctor    # connectivity and configuration report
+    python -m hlperp paper     # real data, simulated fills (default)
+    python -m hlperp live      # real orders, requires HL_ALLOW_LIVE=true
+    python -m hlperp doctor    # connectivity and configuration report
+    python -m hlperp backtest  # offline replay of candles and funding
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ def _build(cfg):
 
         wallet = EthAccount.from_key(cfg.signing_key)
         exchange = Exchange(wallet, base_url=cfg.base_url, account_address=cfg.account_address)
-        broker = LiveBroker(exchange, market.asset_index)
+        broker = LiveBroker(exchange, market.asset_index, market.sz_decimals)
         logging.info("LIVE mode: signer=%s account=%s agent=%s",
                      wallet.address, cfg.account_address, cfg.is_agent_wallet)
     else:
@@ -131,11 +132,29 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
     return 0
 
 
+def cmd_backtest(cfg, interval: str, hours: float) -> int:
+    import json
+
+    from .backtest import Backtester
+
+    bt = Backtester(cfg)
+    try:
+        result = bt.run(interval=interval, lookback_ms=int(hours * 3_600_000))
+    except Exception as exc:
+        print(f"backtest failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result.as_dict(), indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     parser = argparse.ArgumentParser(prog="hl-perp-bot")
-    parser.add_argument("command", choices=["paper", "live", "doctor"], nargs="?", default="paper")
+    parser.add_argument("command", choices=["paper", "live", "doctor", "backtest"],
+                        nargs="?", default="paper")
     parser.add_argument("--seconds", type=float, default=None, help="run for this long then exit")
+    parser.add_argument("--interval", default="1m", help="backtest candle interval")
+    parser.add_argument("--hours", type=float, default=6.0, help="backtest lookback in hours")
     args = parser.parse_args(argv)
 
     try:
@@ -146,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return cmd_doctor(cfg)
+    if args.command == "backtest":
+        return cmd_backtest(cfg, args.interval, args.hours)
     override = "live" if args.command == "live" else "paper"
     return cmd_run(cfg, override, args.seconds)
 

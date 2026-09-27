@@ -52,9 +52,14 @@ class Config:
     private_key: Optional[str]
     risk_pct: float
     max_leverage: int
+    maintenance_leverage: float
     max_drawdown_pct: float
     min_liq_distance_pct: float
     max_notional_pct: float
+    trigger_buffer_bps: float
+    tp_sl_enabled: bool
+    tp_pct: float
+    sl_pct: float
     model: str
     openai_api_key: Optional[str]
     openai_base_url: str
@@ -92,10 +97,25 @@ class Config:
             raise ConfigError("HL_MARGIN_MODE must be cross|isolated")
         if self.order_tif not in ("ALO", "IOC", "GTC"):
             raise ConfigError("HL_ORDER_TIF must be ALO|IOC|GTC")
+        if self.max_leverage < 1:
+            raise ConfigError("HL_MAX_LEVERAGE must be >= 1")
+        if self.maintenance_leverage <= 0:
+            raise ConfigError("HL_MAINTENANCE_LEVERAGE must be > 0")
         if self.leverage < 1 or self.leverage > self.max_leverage:
             raise ConfigError(
                 f"HL_LEVERAGE={self.leverage} must be between 1 and HL_MAX_LEVERAGE={self.max_leverage}"
             )
+        if self.tp_sl_enabled:
+            if self.tp_pct <= 0 or self.sl_pct <= 0:
+                raise ConfigError("HL_TP_PCT and HL_SL_PCT must be positive when TP/SL is enabled")
+            take = self.tp_pct * (1 - self.trigger_buffer_bps / 10_000)
+            stop = self.sl_pct * (1 + self.trigger_buffer_bps / 10_000)
+            if stop >= take:
+                raise ConfigError(
+                    "HL_SL_PCT is too close to HL_TP_PCT: the stop trigger would sit at or "
+                    "beyond the take-profit trigger once the buffer is applied. Widen the gap "
+                    "or lower HL_TRIGGER_BUFFER_BPS."
+                )
         if self.mode == "live":
             if not self.allow_live:
                 raise ConfigError(
@@ -127,9 +147,14 @@ def load_config() -> Config:
         private_key=os.getenv("HL_PRIVATE_KEY") or None,
         risk_pct=_float("HL_RISK_PCT", 0.01),
         max_leverage=_int("HL_MAX_LEVERAGE", 10),
+        maintenance_leverage=_float("HL_MAINTENANCE_LEVERAGE", 2.0),
         max_drawdown_pct=_float("HL_MAX_DRAWDOWN_PCT", 10.0),
         min_liq_distance_pct=_float("HL_MIN_LIQ_DISTANCE_PCT", 15.0),
         max_notional_pct=_float("HL_MAX_NOTIONAL_PCT", 50.0),
+        trigger_buffer_bps=_float("HL_TRIGGER_BUFFER_BPS", 5.0),
+        tp_sl_enabled=_bool("HL_TP_SL", False),
+        tp_pct=_float("HL_TP_PCT", 0.02),
+        sl_pct=_float("HL_SL_PCT", 0.01),
         model=os.getenv("HL_MODEL", "momentum").strip().lower(),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),

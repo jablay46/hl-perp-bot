@@ -81,6 +81,16 @@ class Account:
         except Exception:  # pragma: no cover - network
             return []
 
+    def fills(self, start_ms: int) -> list[dict]:
+        """User fills since ``start_ms``. Used to reconcile live P&L."""
+        if not self.address:
+            return []
+        try:
+            return self.info.user_fills_by_time(self.address, start_ms)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("user_fills_by_time failed: %s", exc)
+            return []
+
     def _paper_state(self, coin: str) -> AccountState:
         return AccountState(
             account_value=self.paper_equity,
