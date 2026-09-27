@@ -1,0 +1,71 @@
+# AGENTS.md
+
+Repository memory for `hl-perp-bot`, an AI perpetual-futures bot for Hyperliquid
+rebuilt from the architecture of `jarrodwatts/jev-trader` (a Monad/Kuru spot demo).
+
+## Hard rules
+
+- **Language and stack are fixed:** Python 3.10+, official `hyperliquid-python-sdk`
+  (`Info` for reads, `Exchange` for signed writes). Do not swap in another client.
+- **Default is safe:** `HL_MODE=paper`, `HL_NETWORK=testnet`. Live trading needs
+  `HL_MODE=live` + `HL_ALLOW_LIVE=true` + a key, and never runs without explicit
+  user permission.
+- **Never commit keys** or `.env`. `.env.example` documents every knob.
+- **Mainnet must use an agent/API wallet**, never a main private key.
+
+## Layout
+
+| Path | Role |
+| --- | --- |
+| `src/hlperp/market.py` | Info snapshots + own WebSocket (`l2Book`/`trades`/`activeAssetCtx`); read-only |
+| `src/hlperp/account.py` | account state, open orders, funding history, `fills()` via `user_fills_by_time` |
+| `src/hlperp/strategy.py` | builds `MarketState`; ALO/IOC quote construction |
+| `src/hlperp/model.py` | `MomentumModel` (deterministic) and `OpenAIModel` (typed JSON) |
+| `src/hlperp/risk.py` | delta sizing, liquidation maths, drawdown kill-switch |
+| `src/hlperp/execution.py` | `LiveBroker` and `PaperBroker` behind one interface, incl. TP/SL |
+| `src/hlperp/trader.py` | the tick loop, P&L, fill reconciliation, bracket arming |
+| `src/hlperp/backtest.py` | offline candle + funding replay |
+| `src/hlperp/server.py` | stdlib dashboard (snapshot, `/events` SSE) |
+
+## Commands
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
+PYTHONPATH=src python -m pytest -q
+PYTHONPATH=src python -m hlperp doctor
+PYTHONPATH=src python -m hlperp paper --seconds 30
+PYTHONPATH=src python -m hlperp backtest --interval 1m --hours 6
+```
+
+There is no test config; tests import `hlperp` from `src`, so `PYTHONPATH=src`
+is required (or install the package editable).
+
+## Design decisions worth not re-litigating
+
+- **Risk sizing is a target, not a per-tick order.** `RiskEngine.size` returns the
+  delta from the current position. A repeat tick with an unchanged signal must
+  not stack; a flip must size the full distance through flat.
+- **Liquidation distance is a gate, not a target.** For fixed leverage the
+  distance is `(1/lev) / (1 - 1/L)` with `L = HL_MAINTENANCE_LEVERAGE` (a real
+  maintenance-margin assumption, *not* the exchange max leverage). If it is under
+  `HL_MIN_LIQ_DISTANCE_PCT`, the order is refused outright.
+- **Hyperliquid's trade `side` is the maker side, not the aggressor.** Verified
+  empirically: prints far below the best bid still report `B`. Paper matching is
+  therefore price-based; do not reintroduce aggressor-side matching.
+- **ALO joins the near touch** (best bid for a buy, best ask for a sell). The
+  best levels are already tick-valid, so rounding cannot push a post-only order
+  across. Quoting at the mid fails when the spread is a single tick.
+- **Live P&L comes from `user_fills_by_time`,** keyed by `(time, oid, hash)` so
+  polling is idempotent. The order acknowledgement does not carry fees or closed
+  PnL.
+- **Brackets are grouped `positionTpsl`**, reduce-only, armed only when position
+  size changes, with the stop clamped strictly inside liquidation.
+
+## Gotchas
+
+- `PaperBroker` fills only a `participation` slice per print (default 0.25), so a
+  large resting order fills over several prints rather than in one.
+- Funding accrues hourly in the live path and per-candle in the backtester; a
+  long pays when the rate is positive.
+- The dashboard port is best-effort: a busy port logs a warning and the bot keeps
+  running without it.
