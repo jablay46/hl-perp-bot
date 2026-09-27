@@ -78,6 +78,14 @@ def cmd_doctor(cfg) -> int:
               f"position={st.position.side if st.position else 'flat'}")
         spot = acct.spot_usdc()
         print(f"spot USDC    {spot}")
+        role = acct.hypercore_mainnet_role()
+        if role is not None:
+            print(f"mainnet role {role}")
+            if role == "missing" and cfg.network == "testnet":
+                print("             -> this address has NO HyperCore mainnet state. A")
+                print("                CCTP-forwarded testnet deposit fails silently and")
+                print("                strands the USDC on HyperEVM. Deposit from the UI")
+                print("                (CoreDepositWallet) instead. See README.")
         if st.account_value <= 0 and spot <= 0:
             print("             -> no perp balance and no spot USDC: nothing to trade")
         elif st.account_value <= 0 and spot > 0:

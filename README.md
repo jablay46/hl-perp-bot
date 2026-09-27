@@ -248,6 +248,31 @@ python -m hlperp funding --to-spot   # perp -> spot, to withdraw
 transfer fees), and it tells you the fix when the perp balance is zero but spot
 is not.
 
+### On testnet, deposit through the UI, not a raw CCTP forward
+
+A testnet deposit sent as a raw CCTP `cctp-forward` (for example, a burn on
+Arbitrum Sepolia whose `hookData` is `cctp-forward`) can succeed on the source
+chain and still never arrive. Circle's docs are explicit about why:
+
+> The recipient address must already exist on HyperCore mainnet. [...]
+> Transfers to addresses without mainnet state fail silently.
+
+So if your address has no HyperCore **mainnet** state, the forward is dropped
+after the mint lands on HyperEVM and you see a completed source transaction with
+a zero HyperCore balance. `doctor` checks this directly:
+
+```
+mainnet role missing
+             -> this address has NO HyperCore mainnet state. A
+                CCTP-forwarded testnet deposit fails silently and
+                strands the USDC on HyperEVM. Deposit from the UI
+                (CoreDepositWallet) instead.
+```
+
+The reliable testnet path is to deposit from the Hyperliquid UI, which routes
+through the CoreDepositWallet, or to use the testnet faucet. A raw forward only
+works for an address that already exists on mainnet.
+
 ### Hyperliquid constraints worth knowing
 
 - **Nonces** are per signer; the 100 highest are kept and must fall within

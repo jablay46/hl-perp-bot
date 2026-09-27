@@ -65,6 +65,11 @@ is required (or install the package editable).
   hold USDC and still refuse every order with `accountValue=0`. The fix is an
   explicit `usd_class_transfer` (`python -m hlperp funding`). `doctor` prints both
   balances and the ledger so this is visible before a live run.
+- **On testnet, a raw CCTP `cctp-forward` deposit fails silently unless the
+  address already exists on HyperCore mainnet** (Circle's documented testnet
+  limitation). The source transaction completes, the USDC is minted on HyperEVM,
+  and HyperCore stays at zero. Deposit through the UI (CoreDepositWallet) or use
+  the faucet. `doctor` reports `mainnet role` to catch this.
 
 ## Gotchas
 

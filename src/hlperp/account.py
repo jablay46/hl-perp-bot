@@ -127,6 +127,29 @@ class Account:
             log.warning("ledger fetch failed: %s", exc)
             return []
 
+    def hypercore_mainnet_role(self) -> Optional[str]:
+        """The account's role on HyperCore *mainnet*, or None if unknown.
+
+        CCTP-forwarding a testnet deposit into HyperCore requires the recipient
+        to already exist on mainnet; if it does not, the forward fails silently
+        and the USDC is left minted on HyperEVM instead.
+        """
+        if not self.address:
+            return None
+        try:
+            import json
+            import urllib.request
+
+            req = urllib.request.Request(
+                constants.MAINNET_API_URL + "/info",
+                data=json.dumps({"type": "userRole", "user": self.address}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            return str(json.loads(urllib.request.urlopen(req, timeout=15).read()).get("role"))
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("mainnet userRole check failed: %s", exc)
+            return None
+
     def _paper_state(self, coin: str) -> AccountState:
         return AccountState(
             account_value=self.paper_equity,
