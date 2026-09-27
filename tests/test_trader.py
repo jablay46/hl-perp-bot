@@ -7,7 +7,7 @@ from hlperp.config import load_config
 from hlperp.execution import PaperBroker
 from hlperp.model import MomentumModel
 from hlperp.trader import Trader
-from hlperp.types import AssetCtx, Book, Level, Signal, TradePrint
+from hlperp.types import AccountState, AssetCtx, Book, Level, Signal, TradePrint
 
 
 class FakeMarket:
@@ -127,6 +127,18 @@ def test_funding_accrues_on_open_position(monkeypatch):
     trader._last_funding_ts -= 3_600_000  # simulate an hour passing
     trader.tick()
     assert trader.totals["funding"] > 0
+
+
+def test_totals_view_flags_unfunded_account(monkeypatch):
+    """A zero-balance account must not report a bogus -100% PnL."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    trader = Trader(cfg, FakeMarket(), Account("testnet", None), PaperBroker("BTC"), MomentumModel())
+    trader.totals["starting_equity"] = 0.0
+    trader.totals["last_equity"] = 0.0
+    view = trader._totals_view(AccountState(0.0, 0.0, 0.0, 0.0, None))
+    assert view["funded"] is False
+    assert view["pnl_pct"] == 0.0 and view["pnl"] == 0.0
+    assert view["equity"] == 0.0
 
 
 class FakeLiveAccount(Account):

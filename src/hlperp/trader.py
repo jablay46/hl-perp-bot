@@ -337,12 +337,21 @@ class Trader:
             self.on_event(event)
         d = event.decision
         t = event.totals
+        order = event.order or {}
+        status = order.get("status", "-")
+        why = ""
+        if status in ("rejected", "error"):
+            why = " (" + str(order.get("error") or "rejected")[:80] + ")"
+        elif d and d.get("risk_block"):
+            why = " (risk: " + str(d["risk_block"])[:80] + ")"
+        if not t.get("funded", True):
+            why += " [account unfunded]"
         log.info(
-            "#%d %s mid=%.1f spread=%.2fbps funding=%.1f%%APR %s ord=%s eq=%.2f pnl=%.3f%%%s",
+            "#%d %s mid=%.1f spread=%.2fbps funding=%.1f%%APR %s ord=%s%s eq=%.2f pnl=%.3f%%%s",
             t["ticks"], self.cfg.coin, event.mid, event.spread_bps, event.funding_apr,
             (f"{d['action']} p_up={d['probabilities']['buy']:.2f} {d['latency_ms']:.0f}ms"
              if d else "no-decision"),
-            (event.order or {}).get("status", "-"), t["equity"], t["pnl_pct"],
+            status, why, t["equity"], t["pnl_pct"],
             " HALTED" if event.halted else "",
         )
         return event
@@ -360,9 +369,13 @@ class Trader:
         return state.account_value
 
     def _totals_view(self, state: AccountState) -> dict:
-        start = self.totals["starting_equity"] or state.account_value or 1.0
+        start = self.totals["starting_equity"] or state.account_value
         equity = self.totals["last_equity"]
-        pnl = equity - start
+        # An unfunded account has equity 0; reporting a -100% PnL against a zero
+        # baseline is noise, not information. Surface it as unfunded instead.
+        funded = bool(start and start > 0)
+        pnl = (equity - start) if funded else 0.0
+        pnl_pct = (pnl / start * 100) if funded else 0.0
         return {
             "ticks": self.totals["ticks"],
             "decisions": self.totals["decisions"],
@@ -374,7 +387,8 @@ class Trader:
             "realized": round(self.totals["realized"], 6),
             "equity": round(equity, 4),
             "pnl": round(pnl, 4),
-            "pnl_pct": round(pnl / start * 100, 4),
+            "pnl_pct": round(pnl_pct, 4),
+            "funded": funded,
         }
 
     def run_forever(self) -> None:

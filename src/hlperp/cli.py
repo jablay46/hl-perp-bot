@@ -90,6 +90,20 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
         object.__setattr__(cfg, "mode", mode_override)
 
     market, account, broker, model = _build(cfg)
+    if cfg.is_live:
+        # An unfunded account produces rejects that look like a broken strategy.
+        # Say so once, clearly, before the loop starts.
+        try:
+            start_state = account.state(cfg.coin)
+            if start_state.account_value <= 0:
+                print(
+                    f"WARNING: live account {cfg.account_address} has accountValue="
+                    f"{start_state.account_value}. No order can be placed. Fund it first "
+                    f"(testnet faucet) or the strategy will only log rejects.",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"WARNING: could not read account state: {exc}", file=sys.stderr)
     server = Server(
         cfg.port,
         meta={
