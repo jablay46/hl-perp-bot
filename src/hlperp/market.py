@@ -31,6 +31,22 @@ def _levels(raw: list[dict]) -> list[Level]:
     return [Level(px=float(x["px"]), sz=float(x["sz"])) for x in raw]
 
 
+def liveness_action(now: float, last_msg: float, ping_sent: float,
+                    ping_after: float, stale_after: float) -> str:
+    """Decide what a silent websocket needs: ``"stale"``, ``"ping"`` or ``"none"``.
+
+    Kept pure so the policy can be tested without a socket. Stale wins over ping:
+    a socket that has gone quiet for ``stale_after`` is already unfit to trade on,
+    so there is no point refreshing its keepalive.
+    """
+    silent = now - last_msg
+    if silent > stale_after:
+        return "stale"
+    if silent > ping_after and now - ping_sent > ping_after:
+        return "ping"
+    return "none"
+
+
 class MarketData:
     PING_AFTER_S = 20.0
     STALE_AFTER_S = 45.0
@@ -158,17 +174,19 @@ class MarketData:
                             msg = ws.recv(timeout=5)
                         except TimeoutError:
                             now = time.time()
-                            silent = now - last_msg
-                            if silent > self.PING_AFTER_S and now - ping_sent > self.PING_AFTER_S:
+                            action = liveness_action(now, last_msg, ping_sent,
+                                                     self.PING_AFTER_S, self.STALE_AFTER_S)
+                            if action == "stale":
+                                # A half-open socket accepts the ping but never
+                                # answers. Without this the loop keeps timing out
+                                # forever and the book/ctx go stale while the bot
+                                # still looks connected.
+                                raise RuntimeError(
+                                    f"no websocket data for {now - last_msg:.0f}s; reconnecting"
+                                )
+                            if action == "ping":
                                 ws.send(json.dumps({"method": "ping"}))
                                 ping_sent = now
-                            # A half-open socket accepts the ping but never answers.
-                            # Without this the loop keeps timing out forever and the
-                            # book/ctx go stale while the bot still looks connected.
-                            if silent > self.STALE_AFTER_S:
-                                raise RuntimeError(
-                                    f"no websocket data for {silent:.0f}s; reconnecting"
-                                )
                             continue
                         last_msg = time.time()
                         self._handle(json.loads(msg))
