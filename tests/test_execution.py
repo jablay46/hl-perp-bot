@@ -99,3 +99,72 @@ def test_paper_fees_are_charged():
     fill = b2.on_print("BTC", 98.5, 1, is_buy=False)[0]
     expected_maker = 1.0 * 99.0 * 1.5 / 10_000
     assert abs(fill.fee - expected_maker) < 1e-9
+
+
+def test_paper_rejects_order_below_venue_minimum():
+    """The paper venue must enforce the same $10 minimum as the real one."""
+    b = PaperBroker("BTC")
+    r = b.place(_sig("buy", "ALO", 99.0), sz=0.0001, mark_px=100.0, sz_decimals=5)
+    assert r.status == "rejected"
+    assert "minimum" in (r.error or "")
+    assert b.open_orders("BTC") == []
+
+
+def test_paper_entry_price_resets_after_flip():
+    """Flipping through zero opens a new position at the fill price, not the old entry."""
+    b = PaperBroker("BTC")
+    b.place(_sig("buy", "IOC", 100.0), 5.0, 100.0, 5)
+    # Sell 8: closes the 5 long and opens a 3 short at ~120.
+    b.place(_sig("sell", "IOC", 120.0), 8.0, 120.0, 5)
+    pos = b.position("BTC")
+    assert pos.size < 0
+    assert abs(pos.entry_px - 120.0) < 1.0
+    # Marked at the flip price the new short has no unrealized PnL.
+    assert abs(b.unrealized("BTC", pos.entry_px)) < 1e-9
+
+
+def test_paper_entry_price_blends_when_adding():
+    b = PaperBroker("BTC")
+    b.place(_sig("buy", "IOC", 100.0), 1.0, 100.0, 5)
+    b.place(_sig("buy", "IOC", 200.0), 1.0, 200.0, 5)
+    pos = b.position("BTC")
+    assert pos.size == 2.0
+    # Simple average because both adds are the same size, before slippage.
+    assert 100.0 < pos.entry_px < 205.0
+
+
+def test_paper_partial_reduce_keeps_entry_price_long():
+    """A partial reduce closes some size and leaves the rest at its original entry."""
+    b = PaperBroker("BTC")
+    b.place(_sig("buy", "IOC", 100.0), 5.0, 100.0, 5)
+    entry = b.position("BTC").entry_px
+    res = b.place(_sig("sell", "IOC", 110.0), 2.0, 110.0, 5)
+    pos = b.position("BTC")
+    assert pos.size == 3.0
+    # Only the closed 2 realize PnL; the remaining 3 keep the original entry.
+    assert abs(pos.entry_px - entry) < 1e-9
+    assert abs(pos.realized - (res.px - entry) * 2.0) < 1e-6
+    assert abs(b.unrealized("BTC", 120.0) - (120.0 - entry) * 3.0) < 1e-6
+
+
+def test_paper_partial_reduce_keeps_entry_price_short():
+    """Same for the short side: covering part of a short must not move the entry."""
+    b = PaperBroker("BTC")
+    b.place(_sig("sell", "IOC", 100.0), 5.0, 100.0, 5)
+    entry = b.position("BTC").entry_px
+    res = b.place(_sig("buy", "IOC", 90.0), 2.0, 90.0, 5)
+    pos = b.position("BTC")
+    assert pos.size == -3.0
+    assert abs(pos.entry_px - entry) < 1e-9
+    assert abs(pos.realized - (entry - res.px) * 2.0) < 1e-6
+    assert abs(b.unrealized("BTC", 80.0) - (entry - 80.0) * 3.0) < 1e-6
+
+
+def test_min_notional_boundary_is_exact():
+    """Exactly $10.00 is accepted; $9.99 is not. Float compare gets this wrong."""
+    b = PaperBroker("BTC")
+    ok = b.place(_sig("buy", "ALO", 100.0), sz=0.1, mark_px=101.0, sz_decimals=2)
+    assert ok.status == "resting"  # 0.1 * 100.0 == 10.00 exactly
+    b2 = PaperBroker("BTC")
+    bad = b2.place(_sig("buy", "ALO", 99.9), sz=0.1, mark_px=101.0, sz_decimals=2)
+    assert bad.status == "rejected"  # 9.99

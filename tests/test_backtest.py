@@ -2,6 +2,7 @@
 
 from hlperp.backtest import Backtester, _FundingPoint
 from hlperp.config import load_config
+from hlperp.rounding import MAX_DECIMALS_PERP
 
 
 def _cfg(monkeypatch, **env):
@@ -46,3 +47,81 @@ def test_backtest_requires_enough_candles(monkeypatch):
         assert "candles" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError")
+
+
+def test_backtest_respects_lot_size_and_venue_minimum(monkeypatch):
+    """A $200 account at BTC's 5-decimal lot sizes to $9.96 and must not order.
+
+    Regression: the backtest used to hardcode 2 decimals, so sizes were silently
+    rounded to a different lot than the venue enforces.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="IOC",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_RISK_PCT=0.01, HL_LEVERAGE=5, HL_MAX_LEVERAGE=10)
+    closes = [83000 + i * 5 for i in range(30)]
+    small = Backtester(cfg, base_equity=200.0, sz_decimals=5)
+    res_small = small.run(candles=_candles(closes), funding=[])
+    assert res_small.orders == 0  # below the $10 minimum at this lot size
+    assert res_small.fills == 0
+
+    # The same replay with enough equity does trade.
+    big = Backtester(cfg, base_equity=100_000.0, sz_decimals=5)
+    res_big = big.run(candles=_candles(closes), funding=[])
+    assert res_big.orders > 0
+
+
+class _FakeInfo:
+    def __init__(self, meta=None, err=None):
+        self._meta = meta
+        self._err = err
+
+    def meta(self):
+        if self._err is not None:
+            raise self._err
+        return self._meta
+
+
+def test_resolve_sz_decimals_from_metadata(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC")
+    bt = Backtester(cfg)
+    monkeypatch.setattr(bt, "_info", lambda: _FakeInfo(
+        meta={"universe": [{"name": "ETH", "szDecimals": 4}, {"name": "BTC", "szDecimals": 5}]}
+    ))
+    assert bt.resolve_sz_decimals() == 5
+    assert bt.sz_decimals == 5  # cached only when resolved from metadata
+
+
+def test_resolve_sz_decimals_unknown_coin_raises(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="NOPE")
+    bt = Backtester(cfg)
+    monkeypatch.setattr(bt, "_info", lambda: _FakeInfo(
+        meta={"universe": [{"name": "BTC", "szDecimals": 5}]}
+    ))
+    try:
+        bt.resolve_sz_decimals()
+    except ValueError as exc:
+        assert "NOPE" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError for unknown coin")
+
+
+def test_resolve_sz_decimals_network_failure_falls_back_without_caching(monkeypatch, caplog):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC")
+    bt = Backtester(cfg)
+    monkeypatch.setattr(bt, "_info", lambda: _FakeInfo(err=OSError("offline")))
+    with caplog.at_level("WARNING"):
+        assert bt.resolve_sz_decimals() == MAX_DECIMALS_PERP
+    assert "falling back" in caplog.text
+    # Not cached, so a later success can still resolve the real lot size.
+    assert bt.sz_decimals is None
+    monkeypatch.setattr(bt, "_info", lambda: _FakeInfo(
+        meta={"universe": [{"name": "BTC", "szDecimals": 5}]}
+    ))
+    assert bt.resolve_sz_decimals() == 5
+
+
+def test_explicit_sz_decimals_skips_metadata(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC")
+    bt = Backtester(cfg, sz_decimals=4)
+    monkeypatch.setattr(bt, "_info", lambda: (_ for _ in ()).throw(AssertionError("no fetch")))
+    assert bt.resolve_sz_decimals() == 4

@@ -17,12 +17,23 @@ import random
 import threading
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional, Protocol
 
 from .rounding import round_px, round_sz
+from .risk import MIN_ORDER_NOTIONAL
 from .types import Fill, OrderResult, Signal, Side
 
 log = logging.getLogger("hlperp.exec")
+
+
+def _below_min_notional(sz: float, px: float) -> bool:
+    """Whether an order is under the $10 minimum, compared without float drift.
+
+    ``sz * px < 10`` in binary floats can put an exactly-$10 order on the wrong
+    side of the boundary; Decimal on the wire-representation strings cannot.
+    """
+    return Decimal(str(sz)) * Decimal(str(px)) < Decimal(str(MIN_ORDER_NOTIONAL))
 
 
 @dataclass
@@ -247,6 +258,12 @@ class PaperBroker:
     def place(self, sig: Signal, sz: float, mark_px: float, sz_decimals: int) -> OrderResult:
         px = round_px(sig.limit_px, sz_decimals)
         sz = round_sz(sz, sz_decimals)
+        if sz <= 0 or _below_min_notional(sz, px):
+            return OrderResult(
+                sig.coin, sig.side, px, sz, sig.tif.upper(), None, "rejected",
+                f"order ${Decimal(str(sz)) * Decimal(str(px)):.2f} is below "
+                f"Hyperliquid's ${MIN_ORDER_NOTIONAL:.0f} minimum", {},
+            )
         tif = sig.tif.upper()
         if tif == "ALO":
             # Post-only: if the price would cross, the venue cancels it instead.
@@ -374,16 +391,28 @@ class PaperBroker:
         signed = sz if side == "buy" else -sz
         closed_pnl = 0.0
         new_size = pos.size + signed
-        if pos.size != 0 and (pos.size > 0) != (signed > 0):
+        # ``pos.size > 0`` is false at flat, so this is only a real opposite-side
+        # fill when a position was already open.
+        reducing = pos.size != 0 and (pos.size > 0) != (signed > 0)
+        if reducing:
             closed_sz = min(abs(pos.size), abs(signed))
             direction = 1 if pos.size > 0 else -1
             closed_pnl = (px - pos.entry_px) * closed_sz * direction
             pos.realized += closed_pnl
         if new_size == 0:
+            # Fully closed: no exposure left to carry an entry price.
             pos.entry_px = 0.0
-        elif (pos.size > 0) == (signed > 0) or pos.size == 0:
+        elif not reducing:
+            # Adding to the position (or opening from flat): blend the entry price.
             total = abs(pos.size) + abs(signed)
             pos.entry_px = (pos.entry_px * abs(pos.size) + px * abs(signed)) / total
+        elif (new_size > 0) != (pos.size > 0):
+            # Flipped through zero: the remainder is a brand-new position, so its
+            # entry is this fill's price. Leaving the old entry makes unrealized PnL
+            # and every later close wrong.
+            pos.entry_px = px
+        # else: partial reduce. The remaining position keeps its original entry
+        # price; only the closed part realizes PnL.
         pos.size = new_size
         rate = self.taker_rate if crossed else self.maker_rate
         fee = sz * px * rate

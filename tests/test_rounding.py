@@ -1,10 +1,20 @@
-from hlperp.rounding import round_px, round_sz, wire
+from hlperp.rounding import floor_sz, round_px, round_sz, wire
 
 
 def test_size_rounds_to_lot():
     assert round_sz(0.00014, 5) == 0.00014
     assert round_sz(1.0001, 3) == 1.0
     assert round_sz(0.12349, 2) == 0.12
+
+
+def test_size_truncates_never_rounds_up():
+    """Rounding up can exceed the balance or intended notional; the venue floors."""
+    assert round_sz(0.125, 2) == 0.12
+    assert round_sz(0.000125, 5) == 0.00012
+    assert floor_sz(0.999, 0) == 0.0
+    # Never larger than the requested size.
+    for sz, d in ((0.126, 2), (1.239, 2), (0.0001235, 5)):
+        assert round_sz(sz, d) <= sz
 
 
 def test_price_five_significant_figures():

@@ -16,11 +16,68 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from typing import Optional
 
 from .config import Config
+from .rounding import floor_sz
 
 log = logging.getLogger("hlperp.risk")
+
+# Hyperliquid rejects any order whose value is below this, with ``MinTradeNtl``.
+# The boundary is exact: 10 is accepted, 9.99 is not. Compared as Decimal, never
+# as float, so the boundary does not fall on the wrong side of binary rounding.
+MIN_ORDER_NOTIONAL = 10.0
+_MIN_ORDER_NOTIONAL_D = Decimal("10")
+
+
+def _lot_floor_d(size: float | str, sz_decimals: int) -> Decimal:
+    """Truncate a size to a whole number of lots, in Decimal (no float drift)."""
+    quantum = Decimal(1).scaleb(-int(sz_decimals))
+    return Decimal(str(size)).quantize(quantum, rounding=ROUND_DOWN)
+
+
+def min_order_notional(px: float, sz_decimals: int) -> float:
+    """The smallest order value Hyperliquid will accept at this lot size.
+
+    Not simply $10: the size must be a whole number of lots, so the minimum is the
+    first lot multiple whose value reaches $10. At BTC's 5 decimals and $83k that
+    is 0.00013 BTC = $10.79, which is why an account sized for exactly $10 is
+    rejected.
+    """
+    if px <= 0 or sz_decimals < 0:
+        return MIN_ORDER_NOTIONAL
+    px_d = Decimal(str(px))
+    lot = Decimal(1).scaleb(-int(sz_decimals))
+    # Smallest whole number of lots whose notional reaches $10. Ceiling on a
+    # Decimal quotient cannot land one lot short the way float division can.
+    lots = (_MIN_ORDER_NOTIONAL_D / (px_d * lot)).to_integral_value(rounding=ROUND_CEILING)
+    return float(lots * lot * px_d)
+
+
+def effective_target_notional(equity: float, risk_pct: float, leverage: int,
+                              max_notional_pct: float) -> float:
+    """The target exposure :meth:`RiskEngine.size` aims at, cap included.
+
+    Kept in one place so the sizing path and the preflight warning cannot compute
+    two different targets and disagree about whether an account is tradeable.
+    """
+    return min(equity * risk_pct * leverage, equity * max_notional_pct / 100.0)
+
+
+def min_equity_for_order(risk_pct: float, leverage: int, px: float, sz_decimals: int,
+                         max_notional_pct: float = 100.0) -> float:
+    """Equity needed before a single order clears the venue minimum.
+
+    ``max_notional_pct`` matters: when it binds, raising equity does not raise the
+    target size proportionally, so the equity needed is higher than the raw
+    ``risk_pct * leverage`` figure suggests. The cap is linear in equity, so the
+    requirement is a threshold on the capped fraction.
+    """
+    per_equity = min(risk_pct * leverage, max_notional_pct / 100.0)
+    if per_equity <= 0:
+        return float("inf")
+    return min_order_notional(px, sz_decimals) / per_equity
 
 
 @dataclass
@@ -107,6 +164,7 @@ class RiskEngine:
         px: float,
         exchange_max_leverage: float,
         current_position: Optional[object] = None,
+        sz_decimals: Optional[int] = None,
     ) -> RiskDecision:
         """Size the next order as the delta toward a target exposure.
 
@@ -115,6 +173,10 @@ class RiskEngine:
         and clipped so we never request more than the exchange's max leverage
         allows. The returned size is the *difference* from the position already
         held, so repeat ticks with an unchanged model do not stack.
+
+        When ``sz_decimals`` is given the size is lot-truncated and checked against
+        Hyperliquid's $10 minimum here, because the exchange would otherwise reject
+        the order and the loop would look healthy while never trading.
         """
         if self.check_kill_switch(equity):
             return RiskDecision(False, 0.0, f"halted: {self.halt_reason}")
@@ -132,8 +194,9 @@ class RiskEngine:
                 f"HL_LEVERAGE={self.cfg.leverage} exceeds the exchange max {exchange_max_leverage:g} for this coin",
             )
 
-        target_notional = equity * self.cfg.risk_pct * self.cfg.leverage
-        target_notional = min(target_notional, equity * self.cfg.max_notional_pct / 100.0)
+        target_notional = effective_target_notional(
+            equity, self.cfg.risk_pct, self.cfg.leverage, self.cfg.max_notional_pct
+        )
         if target_notional <= 0:
             return RiskDecision(False, 0.0, "sized to zero")
 
@@ -144,7 +207,42 @@ class RiskEngine:
 
         order_side = "buy" if delta > 0 else "sell"
         size = abs(delta) / px
-        resulting_notional = abs(cur_signed + delta)
+        if sz_decimals is not None:
+            size = floor_sz(size, sz_decimals)
+            if size <= 0:
+                return RiskDecision(
+                    False, 0.0,
+                    f"size rounds to 0 at {sz_decimals} decimals (target ${abs(delta):.2f})",
+                )
+        # Both figures below must describe the order that is actually sent, i.e.
+        # the lot-truncated size, not the untruncated delta. Using the raw delta
+        # overstates the order and can report a notional the venue never saw.
+        order_notional_d = _lot_floor_d(size, sz_decimals) * Decimal(str(px)) if sz_decimals is not None else Decimal(str(size)) * Decimal(str(px))
+        order_notional = float(order_notional_d)
+        if order_notional < MIN_ORDER_NOTIONAL:
+            if sz_decimals is not None:
+                need = min_equity_for_order(self.cfg.risk_pct, self.cfg.leverage, px,
+                                            sz_decimals, self.cfg.max_notional_pct)
+                hint = (
+                    f"a whole lot is ${px * 10.0 ** -sz_decimals:.2f}, so the smallest "
+                    f"acceptable order is ${min_order_notional(px, sz_decimals):.2f}; "
+                    f"need about ${need:.0f} equity"
+                )
+            else:
+                need = MIN_ORDER_NOTIONAL / max(
+                    effective_target_notional(1.0, self.cfg.risk_pct, self.cfg.leverage,
+                                              self.cfg.max_notional_pct), 1e-9)
+                hint = f"need about ${need:.0f} equity"
+            return RiskDecision(
+                False, 0.0,
+                f"order ${order_notional:.2f} is below Hyperliquid's "
+                f"${MIN_ORDER_NOTIONAL:.0f} minimum ({hint} at HL_LEVERAGE="
+                f"{self.cfg.leverage}, HL_RISK_PCT={self.cfg.risk_pct})",
+                notional=order_notional,
+            )
+        # The exposure after this order, again from the actual truncated size.
+        signed_notional = direction * order_notional
+        resulting_notional = abs(cur_signed + signed_notional)
         # Resulting margin must fit inside equity at the requested leverage.
         if resulting_notional / self.cfg.leverage > equity:
             return RiskDecision(
@@ -163,7 +261,7 @@ class RiskEngine:
             )
 
         return RiskDecision(True, size, "ok", side=order_side,
-                            notional=abs(delta), liq_distance_pct=dist)
+                            notional=order_notional, liq_distance_pct=dist)
 
     @staticmethod
     def _signed_notional(position: Optional[object]) -> float:

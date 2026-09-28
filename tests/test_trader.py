@@ -203,3 +203,83 @@ def test_arm_bracket_places_and_does_not_churn(monkeypatch):
     trader.arm_bracket(state)
     assert [l.px for l in broker._brackets["BTC"]] == [l.px for l in before]
 
+
+class _FakeAccountWithFills:
+    """Returns a fill log that mixes coins, the way a real multi-asset account does."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fills(self, start_ms):
+        return self._rows
+
+
+def test_reconcile_fills_ignores_other_coins(monkeypatch):
+    """A fill for a different coin must not leak into this bot's totals."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    rows = [
+        {"coin": "ETH", "side": "B", "px": 3000.0, "sz": 1.0, "fee": 1.5, "closedPnl": 99.0,
+         "time": int(time.time() * 1000), "oid": 1, "hash": "0xeth", "crossed": True},
+        {"coin": "BTC", "side": "B", "px": 100.0, "sz": 1.0, "fee": 0.05, "closedPnl": 0.0,
+         "time": int(time.time() * 1000), "oid": 2, "hash": "0xbtc", "crossed": False},
+    ]
+    trader = Trader(cfg, market, _FakeAccountWithFills(rows), PaperBroker("BTC"), MomentumModel())
+    out = trader.reconcile_fills()
+    assert [f.coin for f in out] == ["BTC"]
+    assert trader.totals["fills"] == 1
+    assert abs(trader.totals["fees"] - 0.05) < 1e-12
+
+
+def test_reconcile_fills_keeps_partial_fills_distinct_by_tid(monkeypatch):
+    """Two partial fills in one millisecond from one order must both count.
+
+    (time, oid, hash) alone would collapse them; ``tid`` is present on userFills.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    ts = int(time.time() * 1000)
+    common = {"coin": "BTC", "side": "B", "px": 100.0, "sz": 0.5, "closedPnl": 0.0,
+              "time": ts, "oid": 7, "hash": "0xabc", "crossed": False}
+    rows = [{**common, "tid": 111, "fee": 0.01}, {**common, "tid": 222, "fee": 0.02}]
+    trader = Trader(cfg, market, _FakeAccountWithFills(rows), PaperBroker("BTC"), MomentumModel())
+    out = trader.reconcile_fills()
+    assert len(out) == 2          # same (time, oid, hash) but different tid
+    assert trader.totals["fills"] == 2
+    assert abs(trader.totals["fees"] - 0.03) < 1e-12
+
+    # A repeated poll of the same rows must not double count.
+    assert trader.reconcile_fills() == []
+
+
+def test_reconcile_fills_without_tid_still_dedups(monkeypatch):
+    """When tid is absent the key degrades to (time, oid, hash)."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    ts = int(time.time() * 1000)
+    row = {"coin": "BTC", "side": "B", "px": 100.0, "sz": 1.0, "fee": 0.05,
+           "closedPnl": 0.0, "time": ts, "oid": 9, "hash": "0xdef", "crossed": False}
+    trader = Trader(cfg, market, _FakeAccountWithFills([row]), PaperBroker("BTC"), MomentumModel())
+    assert len(trader.reconcile_fills()) == 1
+    assert trader.reconcile_fills() == []  # identical row is deduped
+
+
+def test_signal_for_raises_instead_of_asserting_on_missing_mid(monkeypatch):
+    """An assert would vanish under -O and build an order at nan; must raise."""
+    from hlperp.strategy import Strategy
+    from hlperp.types import Book
+
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper")
+    market = FakeMarket()
+    strat = Strategy(cfg, market, MomentumModel())
+    empty = Book(coin="BTC", ts=0, bids=[], asks=[])
+    try:
+        strat.signal_for("buy", empty, 2)
+    except ValueError as exc:
+        assert "mid" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError")
+

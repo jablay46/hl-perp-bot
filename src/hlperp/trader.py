@@ -107,19 +107,25 @@ class Trader:
         The REST response is the source of truth for live P&L: it carries the
         actual fee (already net of the maker rebate) and the closed PnL, neither
         of which can be read off the order acknowledgement. Fills are keyed by
-        (time, oid, hash) so a repeated poll does not double count.
+        (time, oid, hash, tid) so a repeated poll does not double count, while two
+        partial fills from one order in the same millisecond stay distinct. ``tid``
+        is present on ``userFills``; the key degrades to the old triple when absent.
         """
         rows = self.account.fills(self._last_fill_ts)
         out: list[Fill] = []
         for r in rows:
             ts = int(r.get("time", 0))
             oid = int(r.get("oid", 0) or 0)
-            key = (ts, oid, str(r.get("hash", "")))
+            tid = r.get("tid")
+            key = (ts, oid, str(r.get("hash", "")), int(tid) if tid is not None else None)
             if key in self._seen_fills:
                 continue
             self._seen_fills.add(key)
             if ts > self._last_fill_ts:
                 self._last_fill_ts = ts
+            # Filter before applying: a fill for another coin must not reach totals.
+            if r.get("coin", self.cfg.coin) != self.cfg.coin:
+                continue
             fill = Fill(
                 coin=r.get("coin", self.cfg.coin),
                 side="buy" if r.get("side") == "B" else "sell",
@@ -132,8 +138,6 @@ class Trader:
                 crossed=bool(r.get("crossed", False)),
                 hash=str(r.get("hash", "")),
             )
-            if fill.coin != self.cfg.coin:
-                continue
             self._apply_fill(fill)
             out.append(fill)
         return out
@@ -285,6 +289,7 @@ class Trader:
                 sig.limit_px,
                 exchange_max_leverage=self.market.max_leverage,
                 current_position=pos_view,
+                sz_decimals=self.market.sz_decimals,
             )
             if size_dec.allowed:
                 # The risk engine may flip the side (e.g. an existing long that

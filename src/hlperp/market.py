@@ -31,7 +31,26 @@ def _levels(raw: list[dict]) -> list[Level]:
     return [Level(px=float(x["px"]), sz=float(x["sz"])) for x in raw]
 
 
+def liveness_action(now: float, last_msg: float, ping_sent: float,
+                    ping_after: float, stale_after: float) -> str:
+    """Decide what a silent websocket needs: ``"stale"``, ``"ping"`` or ``"none"``.
+
+    Kept pure so the policy can be tested without a socket. Stale wins over ping:
+    a socket that has gone quiet for ``stale_after`` is already unfit to trade on,
+    so there is no point refreshing its keepalive.
+    """
+    silent = now - last_msg
+    if silent > stale_after:
+        return "stale"
+    if silent > ping_after and now - ping_sent > ping_after:
+        return "ping"
+    return "none"
+
+
 class MarketData:
+    PING_AFTER_S = 20.0
+    STALE_AFTER_S = 45.0
+
     def __init__(self, network: str, coin: str) -> None:
         self.network = network
         self.coin = coin
@@ -148,15 +167,28 @@ class MarketData:
                 with ws_client.connect(url, open_timeout=10, close_timeout=5) as ws:
                     self._send_subs(ws)
                     backoff = 1.0
-                    last_ping = time.time()
+                    last_msg = time.time()
+                    ping_sent = 0.0
                     while not self._stop.is_set():
                         try:
                             msg = ws.recv(timeout=5)
                         except TimeoutError:
-                            if time.time() - last_ping > 20:
+                            now = time.time()
+                            action = liveness_action(now, last_msg, ping_sent,
+                                                     self.PING_AFTER_S, self.STALE_AFTER_S)
+                            if action == "stale":
+                                # A half-open socket accepts the ping but never
+                                # answers. Without this the loop keeps timing out
+                                # forever and the book/ctx go stale while the bot
+                                # still looks connected.
+                                raise RuntimeError(
+                                    f"no websocket data for {now - last_msg:.0f}s; reconnecting"
+                                )
+                            if action == "ping":
                                 ws.send(json.dumps({"method": "ping"}))
-                                last_ping = time.time()
+                                ping_sent = now
                             continue
+                        last_msg = time.time()
                         self._handle(json.loads(msg))
             except Exception as exc:  # pragma: no cover - network
                 log.warning("ws disconnected (%s); retrying in %.0fs", exc, backoff)

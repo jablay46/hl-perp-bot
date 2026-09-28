@@ -92,3 +92,31 @@ is required (or install the package editable).
   long pays when the rate is positive.
 - The dashboard port is best-effort: a busy port logs a warning and the bot keeps
   running without it.
+
+## Sizing and the venue minimum
+
+- **Hyperliquid rejects any order below $10 notional** (`MinTradeNtl`). The real
+  floor is lot-aware: the size must be a whole number of lots, so the smallest
+  acceptable order is the first lot multiple reaching $10 - $10.79 for BTC at 5
+  decimals, not $10. `min_order_notional` / `min_equity_for_order` compute it.
+- **Sizes are floor-truncated, never rounded up** (`floor_sz`). Rounding up can
+  request more than the balance or the risk budget and the venue rejects the
+  whole order. `round_sz` is an alias for `floor_sz`.
+- **At the defaults (`HL_RISK_PCT=0.01`, `HL_LEVERAGE=5`) equity below ~$216
+  cannot place a single BTC order.** `RiskEngine.size` refuses with the equity
+  needed; `cmd_run` prints the same warning before the loop starts. This figure
+  holds only while `HL_MAX_NOTIONAL_PCT` does not bind: when it does, the target
+  grows slower with equity and the requirement is higher (at a 1% cap it is
+  ~$1079). `min_equity_for_order` takes the cap, and `cmd_run` uses the shared
+  `effective_target_notional` so the warning cannot disagree with sizing.
+- **The backtester resolves `sz_decimals` from metadata**, falling back to 6
+  offline. A hardcoded lot finer than the asset's truncates every size to zero
+  and the run reports no fills while looking healthy. A network failure logs a
+  WARNING and is *not* cached, so a later success still resolves the real lot; an
+  unknown coin raises `ValueError` instead of silently using the fallback.
+- **`PaperBroker` enforces the same $10 minimum and resets `entry_px` on a flip.**
+  A flip through zero is a new position; keeping the old entry corrupts
+  unrealized PnL and every later close. A *partial* reduce is the opposite case:
+  the remainder keeps its original entry and only the closed size realizes PnL.
+- **Never `assert` a market invariant** (`signal_for` mid). Asserts are stripped
+  under `-O` and the code then builds an order at `nan`. Raise instead.
