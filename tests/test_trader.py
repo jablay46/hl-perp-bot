@@ -232,6 +232,41 @@ def test_reconcile_fills_ignores_other_coins(monkeypatch):
     assert abs(trader.totals["fees"] - 0.05) < 1e-12
 
 
+def test_reconcile_fills_keeps_partial_fills_distinct_by_tid(monkeypatch):
+    """Two partial fills in one millisecond from one order must both count.
+
+    (time, oid, hash) alone would collapse them; ``tid`` is present on userFills.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    ts = int(time.time() * 1000)
+    common = {"coin": "BTC", "side": "B", "px": 100.0, "sz": 0.5, "closedPnl": 0.0,
+              "time": ts, "oid": 7, "hash": "0xabc", "crossed": False}
+    rows = [{**common, "tid": 111, "fee": 0.01}, {**common, "tid": 222, "fee": 0.02}]
+    trader = Trader(cfg, market, _FakeAccountWithFills(rows), PaperBroker("BTC"), MomentumModel())
+    out = trader.reconcile_fills()
+    assert len(out) == 2          # same (time, oid, hash) but different tid
+    assert trader.totals["fills"] == 2
+    assert abs(trader.totals["fees"] - 0.03) < 1e-12
+
+    # A repeated poll of the same rows must not double count.
+    assert trader.reconcile_fills() == []
+
+
+def test_reconcile_fills_without_tid_still_dedups(monkeypatch):
+    """When tid is absent the key degrades to (time, oid, hash)."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+    market = FakeMarket()
+    ts = int(time.time() * 1000)
+    row = {"coin": "BTC", "side": "B", "px": 100.0, "sz": 1.0, "fee": 0.05,
+           "closedPnl": 0.0, "time": ts, "oid": 9, "hash": "0xdef", "crossed": False}
+    trader = Trader(cfg, market, _FakeAccountWithFills([row]), PaperBroker("BTC"), MomentumModel())
+    assert len(trader.reconcile_fills()) == 1
+    assert trader.reconcile_fills() == []  # identical row is deduped
+
+
 def test_signal_for_raises_instead_of_asserting_on_missing_mid(monkeypatch):
     """An assert would vanish under -O and build an order at nan; must raise."""
     from hlperp.strategy import Strategy

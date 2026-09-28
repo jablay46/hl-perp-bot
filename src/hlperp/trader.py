@@ -107,14 +107,17 @@ class Trader:
         The REST response is the source of truth for live P&L: it carries the
         actual fee (already net of the maker rebate) and the closed PnL, neither
         of which can be read off the order acknowledgement. Fills are keyed by
-        (time, oid, hash) so a repeated poll does not double count.
+        (time, oid, hash, tid) so a repeated poll does not double count, while two
+        partial fills from one order in the same millisecond stay distinct. ``tid``
+        is present on ``userFills``; the key degrades to the old triple when absent.
         """
         rows = self.account.fills(self._last_fill_ts)
         out: list[Fill] = []
         for r in rows:
             ts = int(r.get("time", 0))
             oid = int(r.get("oid", 0) or 0)
-            key = (ts, oid, str(r.get("hash", "")))
+            tid = r.get("tid")
+            key = (ts, oid, str(r.get("hash", "")), int(tid) if tid is not None else None)
             if key in self._seen_fills:
                 continue
             self._seen_fills.add(key)
