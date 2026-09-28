@@ -204,6 +204,52 @@ python -m hlperp paper --seconds 60    # bounded run, useful for CI/smoke
 | `HL_TP_PCT` / `HL_SL_PCT` | `0.02` / `0.01` | bracket distances from the mark |
 | `HL_INTERVAL` | `2.0` | seconds between decisions |
 | `HL_MODEL` | `momentum` | `momentum` stand-in or `openai` |
+| `OPENAI_BASE_URL` | OpenAI | any OpenAI-compatible endpoint, e.g. OpenRouter |
+| `HL_MODEL_ID` | `gpt-4o-mini` | model name at that endpoint |
+| `HL_LLM_JSON_MODE` | `true` | send `response_format`; disable for most free models |
+
+---
+
+## Using an LLM model (including OpenRouter free models)
+
+`HL_MODEL=openai` selects a client for **any OpenAI-compatible chat completions
+endpoint**, so OpenRouter works without code changes. Point the three variables
+at OpenRouter and pick a free model:
+
+```bash
+HL_MODEL=openai
+OPENAI_API_KEY=sk-or-v1-...
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+HL_MODEL_ID=google/gemma-4-31b-it:free
+HL_LLM_JSON_MODE=false        # see below
+HL_INTERVAL=30                # free models are slow and rate limited
+```
+
+Then verify before trusting it:
+
+```bash
+python -m hlperp paper --seconds 60   # watch the tick lines
+```
+
+Three things decide whether a free model actually works here:
+
+1. **JSON mode.** The client asks for `{"up": ..., "reason": ...}`. Only about a
+   third of OpenRouter's free models implement `response_format`, so
+   `HL_LLM_JSON_MODE=false` avoids a hard 400 on the rest. The reply is parsed
+   leniently regardless: bare JSON, fenced JSON, and JSON buried in prose all
+   work, and a `reasoning` field is accepted when `content` is null.
+2. **Rate limits and latency.** Free models are shared and often answer in
+   seconds. With `HL_INTERVAL=2` you will exhaust the quota and every other tick
+   will fall back. Raise the interval; a perp bot does not need a decision every
+   two seconds.
+3. **Fallback is silent by design.** Any failure (timeout, 429, unparseable
+   reply) degrades to `MomentumModel` and the tick reason becomes
+   `fallback: ...`. That keeps the loop alive, but it also means a broken model
+   can look like a working one. Watch for that prefix in the logs, or run
+   `HL_MODEL=momentum` when you want to isolate strategy from model.
+
+`doctor` reports the configured model, so a misconfigured endpoint is visible
+before a run.
 
 ---
 

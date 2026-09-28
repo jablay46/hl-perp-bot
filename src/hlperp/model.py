@@ -73,14 +73,42 @@ _JSON_HINT = (
 )
 
 
-class OpenAIModel:
-    """A real LLM via any OpenAI-compatible chat completions endpoint."""
+def _extract_json(text: str) -> dict:
+    """Parse the model's reply into a dict.
 
-    def __init__(self, api_key: str, base_url: str, model_id: str, horizon: int) -> None:
+    Free and reasoning models routinely wrap JSON in prose or code fences even
+    when asked not to, so this falls back to the outermost brace pair rather
+    than failing the whole tick.
+    """
+    if not text:
+        raise ValueError("empty completion")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError(f"no JSON object in reply: {text[:120]!r}")
+    return json.loads(text[start:end + 1])
+
+
+class OpenAIModel:
+    """A real LLM via any OpenAI-compatible chat completions endpoint.
+
+    Works with OpenAI, OpenRouter, Together, Groq, vLLM and similar. OpenRouter
+    free models are supported but vary in quality: most do not implement
+    ``response_format``, so ``json_mode`` is configurable and the reply is parsed
+    leniently either way.
+    """
+
+    def __init__(self, api_key: str, base_url: str, model_id: str, horizon: int,
+                 json_mode: bool = True, extra_headers: dict | None = None) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
         self.horizon = horizon
+        self.json_mode = json_mode
+        self.extra_headers = extra_headers or {}
         self.name = f"openai:{model_id}"
         self._fallback = MomentumModel()
 
@@ -94,8 +122,9 @@ class OpenAIModel:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0,
-            "response_format": {"type": "json_object"},
         }
+        if self.json_mode:
+            payload["response_format"] = {"type": "json_object"}
         try:
             req = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
@@ -103,12 +132,14 @@ class OpenAIModel:
                 headers={
                     "content-type": "application/json",
                     "authorization": f"Bearer {self.api_key}",
+                    **self.extra_headers,
                 },
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 body = json.loads(resp.read())
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            message = body["choices"][0]["message"]
+            content = message.get("content") or message.get("reasoning") or ""
+            parsed = _extract_json(content)
             up = max(0.0, min(1.0, float(parsed["up"])))
             usage = body.get("usage", {}).get("prompt_tokens", 0)
             return Decision(
@@ -128,5 +159,13 @@ class OpenAIModel:
 
 def create_model(cfg) -> Model:
     if cfg.model == "openai" and cfg.openai_api_key:
-        return OpenAIModel(cfg.openai_api_key, cfg.openai_base_url, cfg.model_id, cfg.horizon)
+        headers = {}
+        if "openrouter.ai" in cfg.openai_base_url:
+            # OpenRouter attribution headers; optional but recommended.
+            headers["HTTP-Referer"] = "https://github.com/jablay46/hl-perp-bot"
+            headers["X-Title"] = "hl-perp-bot"
+        return OpenAIModel(
+            cfg.openai_api_key, cfg.openai_base_url, cfg.model_id, cfg.horizon,
+            json_mode=cfg.llm_json_mode, extra_headers=headers,
+        )
     return MomentumModel()

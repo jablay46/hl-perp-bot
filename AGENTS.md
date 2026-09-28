@@ -71,6 +71,14 @@ is required (or install the package editable).
   and HyperCore stays at zero. Deposit through the UI (CoreDepositWallet) or use
   the faucet. `doctor` reports `mainnet role` to catch this.
 
+- **`HL_MODEL=openai` is a generic OpenAI-compatible client**, so OpenRouter and
+  similar work by pointing `OPENAI_BASE_URL` at them. Most OpenRouter free models
+  reject `response_format`, hence the `HL_LLM_JSON_MODE` switch, and replies are
+  parsed leniently (bare/fenced/prose-wrapped JSON, or a `reasoning` field).
+- **LLM failure degrades silently to `MomentumModel`** and the tick reason starts
+  with `fallback:`. A broken model therefore looks like a working one unless you
+  watch for that prefix.
+
 ## Gotchas
 
 - `PaperBroker` fills only a `participation` slice per print (default 0.25), so a

@@ -57,6 +57,12 @@ def cmd_doctor(cfg) -> int:
     print(f"mode         {cfg.mode}   (live={cfg.is_live})")
     print(f"base_url     {cfg.base_url}")
     print(f"coin         {cfg.coin}")
+    print(f"model        {cfg.model}" + (f"  {cfg.model_id}" if cfg.model == "openai" else ""))
+    if cfg.model == "openai":
+        if not cfg.openai_api_key:
+            print("             -> HL_MODEL=openai but no OPENAI_API_KEY: momentum is used")
+        else:
+            print(f"             endpoint={cfg.openai_base_url} json_mode={cfg.llm_json_mode}")
     ok = True
     try:
         market = MarketData(cfg.network, cfg.coin)
