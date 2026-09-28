@@ -154,6 +154,90 @@ def test_create_model_defaults_to_momentum_without_a_key(monkeypatch):
     assert isinstance(create_model(cfg), MomentumModel)
 
 
+def _serve_sequence(statuses, retry_after=None):
+    """Serve a sequence of HTTP statuses; 200 returns a valid JSON decision."""
+    class Handler(BaseHTTPRequestHandler):
+        n = 0
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", 0))
+            self.rfile.read(length)
+            code = statuses[min(Handler.n, len(statuses) - 1)]
+            Handler.n += 1
+            if code == 200:
+                body = json.dumps({"choices": [{"message": {
+                    "content": '{"up": 0.66, "reason": "recovered"}'}}],
+                    "usage": {"prompt_tokens": 5}}).encode()
+            else:
+                body = b'{"error":{"message":"rate limited","code":429}}'
+            self.send_response(code)
+            if retry_after is not None:
+                self.send_header("retry-after", str(retry_after))
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{httpd.server_port}", httpd
+
+
+def test_retries_429_then_succeeds():
+    base, httpd = _serve_sequence([429, 429, 200], retry_after=0)
+    try:
+        m = OpenAIModel("k", base, "x:free", horizon=60, json_mode=False,
+                        max_retries=2, retry_base_s=0.0)
+        d = m.decide(_state())
+        assert d.reason == "recovered" and abs(d.up - 0.66) < 1e-9
+        assert m.last_status == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_persistent_429_falls_back_with_a_clear_reason():
+    base, httpd = _serve_sequence([429], retry_after=0)
+    try:
+        m = OpenAIModel("k", base, "x:free", horizon=60, json_mode=False,
+                        max_retries=2, retry_base_s=0.0)
+        d = m.decide(_state())
+        assert d.reason == "fallback: rate limited (HTTP 429)"
+        assert m.last_status == 429
+    finally:
+        httpd.shutdown()
+
+
+def test_non_retryable_status_does_not_retry():
+    """A 400 (e.g. response_format unsupported) must fail immediately."""
+    base, httpd = _serve_sequence([400, 200])
+    try:
+        m = OpenAIModel("k", base, "x:free", horizon=60, json_mode=True,
+                        max_retries=5, retry_base_s=0.0)
+        d = m.decide(_state())
+        assert d.reason.startswith("fallback:")
+        # Never reached the 200: the two entries after 400 were not consumed.
+        assert httpd.RequestHandlerClass.n == 1
+    finally:
+        httpd.shutdown()
+
+
+def test_retry_after_header_is_honoured_and_capped():
+    from hlperp.model import _retry_after
+
+    class H(dict):
+        pass
+
+    assert _retry_after(H({"retry-after": "3"}), 0, 0.5) == 3.0
+    assert _retry_after(H({"retry-after": "9999"}), 0, 0.5) == 30.0
+    # No header: exponential on the base.
+    assert _retry_after(H(), 0, 0.5) == 0.5
+    assert _retry_after(H(), 2, 0.5) == 2.0
+    assert _retry_after(None, 0, 1.0) == 1.0
+
+
 def test_llm_check_exit_codes(monkeypatch, capsys):
     """llm-check must fail loudly when the endpoint is unusable."""
     from hlperp.cli import cmd_llm_check

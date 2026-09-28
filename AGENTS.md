@@ -79,6 +79,10 @@ is required (or install the package editable).
 - **LLM failure degrades silently to `MomentumModel`** and the tick reason starts
   with `fallback:`. A broken model therefore looks like a working one unless you
   watch for that prefix.
+- **429/5xx are retried before falling back** (`HL_LLM_MAX_RETRIES`,
+  `HL_LLM_RETRY_BASE`), honouring `Retry-After` and capped at 30s. A 429 that
+  survives retries becomes `fallback: rate limited (HTTP 429)`. `OpenAIModel` is
+  shared across ticks, so `last_status` holds the most recent HTTP code.
 
 ## Gotchas
 

@@ -167,9 +167,12 @@ def cmd_llm_check(cfg, runs: int) -> int:
     print(f"model        {cfg.model_id}")
     print(f"endpoint     {cfg.openai_base_url}")
     print(f"json_mode    {cfg.llm_json_mode}")
+    print(f"retries      {cfg.llm_max_retries} (base {cfg.llm_retry_base_s}s, 429/5xx)")
 
     model = OpenAIModel(cfg.openai_api_key, cfg.openai_base_url, cfg.model_id,
-                        cfg.horizon, json_mode=cfg.llm_json_mode)
+                        cfg.horizon, json_mode=cfg.llm_json_mode,
+                        max_retries=cfg.llm_max_retries,
+                        retry_base_s=cfg.llm_retry_base_s)
     # A plausible snapshot so the model sees the real prompt shape.
     state = MarketState(
         coin=cfg.coin, ts=int(time.time() * 1000), mid=100.0, mark_px=100.0,

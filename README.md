@@ -207,6 +207,8 @@ python -m hlperp paper --seconds 60    # bounded run, useful for CI/smoke
 | `OPENAI_BASE_URL` | OpenAI | any OpenAI-compatible endpoint, e.g. OpenRouter |
 | `HL_MODEL_ID` | `gpt-4o-mini` | model name at that endpoint |
 | `HL_LLM_JSON_MODE` | `true` | send `response_format`; disable for most free models |
+| `HL_LLM_MAX_RETRIES` | `2` | retries on 429/5xx before falling back |
+| `HL_LLM_RETRY_BASE` | `0.5` | backoff base seconds (capped 30s, honours `Retry-After`) |
 
 ---
 
@@ -259,9 +261,10 @@ Three things decide whether a free model actually works here:
    leniently regardless: bare JSON, fenced JSON, and JSON buried in prose all
    work, and a `reasoning` field is accepted when `content` is null.
 2. **Rate limits and latency.** Free models are shared and often answer in
-   seconds. With `HL_INTERVAL=2` you will exhaust the quota and every other tick
-   will fall back. Raise the interval; a perp bot does not need a decision every
-   two seconds.
+   seconds. A `429` is retried with exponential backoff (honouring `Retry-After`,
+   capped at 30s) up to `HL_LLM_MAX_RETRIES` times before the tick falls back to
+   momentum. Raise `HL_INTERVAL` so retries are not constantly needed in the
+   first place; a perp bot does not need a decision every two seconds.
 3. **Fallback is silent by design.** Any failure (timeout, 429, unparseable
    reply) degrades to `MomentumModel` and the tick reason becomes
    `fallback: ...`. That keeps the loop alive, but it also means a broken model

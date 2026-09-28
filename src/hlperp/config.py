@@ -65,6 +65,8 @@ class Config:
     openai_base_url: str
     model_id: str
     llm_json_mode: bool
+    llm_max_retries: int
+    llm_retry_base_s: float
     port: int
     interval_s: float
 
@@ -162,6 +164,8 @@ def load_config() -> Config:
         model_id=os.getenv("HL_MODEL_ID", "gpt-4o-mini"),
         # Most OpenRouter free models reject response_format; let callers disable it.
         llm_json_mode=_bool("HL_LLM_JSON_MODE", True),
+        llm_max_retries=_int("HL_LLM_MAX_RETRIES", 2),
+        llm_retry_base_s=_float("HL_LLM_RETRY_BASE", 0.5),
         port=_int("HL_PORT", 8787),
         interval_s=_float("HL_INTERVAL", 2.0),
     )

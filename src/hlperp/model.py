@@ -15,8 +15,9 @@ import json
 import logging
 import math
 import time
+import urllib.error
 import urllib.request
-from typing import Protocol
+from typing import Optional, Protocol
 
 from .types import Decision, MarketState
 
@@ -92,6 +93,21 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+_RETRYABLE = {429, 500, 502, 503, 504}
+
+
+def _retry_after(headers, attempt: int, base: float) -> float:
+    """Seconds to wait before retrying. Honours Retry-After when present."""
+    if headers is not None:
+        raw = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+        if raw:
+            try:
+                return min(30.0, float(raw))
+            except ValueError:
+                pass
+    return min(30.0, base * (2 ** attempt))
+
+
 class OpenAIModel:
     """A real LLM via any OpenAI-compatible chat completions endpoint.
 
@@ -99,18 +115,40 @@ class OpenAIModel:
     free models are supported but vary in quality: most do not implement
     ``response_format``, so ``json_mode`` is configurable and the reply is parsed
     leniently either way.
+
+    429 and 5xx are retried with exponential backoff (honouring ``Retry-After``)
+    before the model degrades to momentum, because free tiers rate limit
+    aggressively.
     """
 
     def __init__(self, api_key: str, base_url: str, model_id: str, horizon: int,
-                 json_mode: bool = True, extra_headers: dict | None = None) -> None:
+                 json_mode: bool = True, extra_headers: dict | None = None,
+                 max_retries: int = 2, retry_base_s: float = 0.5) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
         self.horizon = horizon
         self.json_mode = json_mode
         self.extra_headers = extra_headers or {}
+        self.max_retries = max(0, max_retries)
+        self.retry_base_s = retry_base_s
         self.name = f"openai:{model_id}"
+        self.last_status: Optional[int] = None
         self._fallback = MomentumModel()
+
+    def _post(self, payload: dict) -> dict:
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "content-type": "application/json",
+                "authorization": f"Bearer {self.api_key}",
+                **self.extra_headers,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            self.last_status = resp.status
+            return json.loads(resp.read())
 
     def decide(self, state: MarketState) -> Decision:
         t0 = time.perf_counter()
@@ -125,36 +163,43 @@ class OpenAIModel:
         }
         if self.json_mode:
             payload["response_format"] = {"type": "json_object"}
-        try:
-            req = urllib.request.Request(
-                f"{self.base_url}/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={
-                    "content-type": "application/json",
-                    "authorization": f"Bearer {self.api_key}",
-                    **self.extra_headers,
-                },
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                body = json.loads(resp.read())
-            message = body["choices"][0]["message"]
-            content = message.get("content") or message.get("reasoning") or ""
-            parsed = _extract_json(content)
-            up = max(0.0, min(1.0, float(parsed["up"])))
-            usage = body.get("usage", {}).get("prompt_tokens", 0)
-            return Decision(
-                action="buy" if up >= 0.5 else "sell",
-                probabilities={"buy": up, "sell": 1 - up, "hold": 0.0},
-                up=up,
-                latency_ms=(time.perf_counter() - t0) * 1000,
-                input_tokens=int(usage),
-                reason=str(parsed.get("reason", ""))[:120],
-            )
-        except Exception as exc:
-            log.warning("LLM call failed (%s); falling back to momentum", exc)
-            d = self._fallback.decide(state)
-            d.reason = f"fallback: {exc}"[:120]
-            return d
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                body = self._post(payload)
+                message = body["choices"][0]["message"]
+                content = message.get("content") or message.get("reasoning") or ""
+                parsed = _extract_json(content)
+                up = max(0.0, min(1.0, float(parsed["up"])))
+                usage = body.get("usage", {}).get("prompt_tokens", 0)
+                return Decision(
+                    action="buy" if up >= 0.5 else "sell",
+                    probabilities={"buy": up, "sell": 1 - up, "hold": 0.0},
+                    up=up,
+                    latency_ms=(time.perf_counter() - t0) * 1000,
+                    input_tokens=int(usage),
+                    reason=str(parsed.get("reason", ""))[:120],
+                )
+            except urllib.error.HTTPError as exc:
+                self.last_status = exc.code
+                last_error = exc
+                if exc.code not in _RETRYABLE or attempt == self.max_retries:
+                    break
+                delay = _retry_after(exc.headers, attempt, self.retry_base_s)
+                log.warning("LLM HTTP %s; retry %s/%s in %.1fs",
+                            exc.code, attempt + 1, self.max_retries, delay)
+                time.sleep(delay)
+            except Exception as exc:
+                last_error = exc
+                break
+
+        status = getattr(last_error, "code", None)
+        detail = f"rate limited (HTTP {status})" if status == 429 else str(last_error)
+        log.warning("LLM call failed (%s); falling back to momentum", detail)
+        d = self._fallback.decide(state)
+        d.reason = f"fallback: {detail}"[:120]
+        return d
 
 
 def create_model(cfg) -> Model:
@@ -167,5 +212,6 @@ def create_model(cfg) -> Model:
         return OpenAIModel(
             cfg.openai_api_key, cfg.openai_base_url, cfg.model_id, cfg.horizon,
             json_mode=cfg.llm_json_mode, extra_headers=headers,
+            max_retries=cfg.llm_max_retries, retry_base_s=cfg.llm_retry_base_s,
         )
     return MomentumModel()
