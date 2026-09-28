@@ -5,6 +5,7 @@
     python -m hlperp doctor    # connectivity, balances and configuration report
     python -m hlperp backtest  # offline replay of candles and funding
     python -m hlperp funding   # move USDC spot <-> perp (deposits land in spot)
+    python -m hlperp llm-check # send one prompt to the configured LLM and report
 """
 
 from __future__ import annotations
@@ -142,6 +143,66 @@ def cmd_funding(cfg, amount: float | None, to_perp: bool) -> int:
     return 0
 
 
+def cmd_llm_check(cfg, runs: int) -> int:
+    """Send the real prompt to the configured model and report what comes back.
+
+    The bot degrades to MomentumModel on any LLM failure, so a misconfigured
+    endpoint or a model that cannot answer JSON looks like a working bot. This
+    is the check that tells the two apart before a run.
+    """
+    import statistics
+
+    from .model import OpenAIModel
+    from .types import MarketState
+
+    if cfg.model != "openai":
+        print(f"HL_MODEL is {cfg.model!r}, not 'openai': the momentum model needs no "
+              f"endpoint and is always available.")
+        return 0
+    if not cfg.openai_api_key:
+        print("HL_MODEL=openai but OPENAI_API_KEY is empty; momentum is used instead.",
+              file=sys.stderr)
+        return 2
+
+    print(f"model        {cfg.model_id}")
+    print(f"endpoint     {cfg.openai_base_url}")
+    print(f"json_mode    {cfg.llm_json_mode}")
+
+    model = OpenAIModel(cfg.openai_api_key, cfg.openai_base_url, cfg.model_id,
+                        cfg.horizon, json_mode=cfg.llm_json_mode)
+    # A plausible snapshot so the model sees the real prompt shape.
+    state = MarketState(
+        coin=cfg.coin, ts=int(time.time() * 1000), mid=100.0, mark_px=100.0,
+        oracle_px=100.0, spread_bps=1.0, funding_hourly=0.0001, funding_apr=0.876,
+        open_interest=1.0, day_ntl_vlm=1e6, book_imbalance=0.1, depth_usd={},
+        returns_bps={"last20": 1.0}, recent_mids="100 101", trades={"cvd_ratio": 0.2},
+        recent_trades=[], position_side="flat", position_size=0.0,
+        unrealized_pnl=0.0, account_value=10_000.0, allowed={"buy": True, "sell": True},
+    )
+
+    ok, latencies, tokens = 0, [], []
+    for i in range(1, runs + 1):
+        d = model.decide(state)
+        failed = d.reason.startswith("fallback:")
+        ok += not failed
+        latencies.append(d.latency_ms)
+        tokens.append(d.input_tokens)
+        verdict = "FAIL" if failed else "ok  "
+        print(f"run {i:<3} {verdict} up={d.up:.3f} {d.action:<4} "
+              f"{d.latency_ms:7.0f}ms tok={d.input_tokens:<6} {d.reason[:70]}")
+
+    print(f"result       {ok}/{runs} answered")
+    if latencies:
+        print(f"latency      median={statistics.median(latencies):.0f}ms "
+              f"max={max(latencies):.0f}ms")
+    if ok == 0:
+        print("             -> every call failed; the bot would run on momentum only")
+        return 1
+    if ok < runs:
+        print("             -> intermittent failures; raise HL_INTERVAL to reduce them")
+    return 0
+
+
 def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
     if mode_override and mode_override != cfg.mode:
         # Re-validate with the requested mode by re-loading env is overkill; the
@@ -227,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     parser = argparse.ArgumentParser(prog="hl-perp-bot")
     parser.add_argument("command",
-                        choices=["paper", "live", "doctor", "backtest", "funding"],
+                        choices=["paper", "live", "doctor", "backtest", "funding", "llm-check"],
                         nargs="?", default="paper")
     parser.add_argument("--seconds", type=float, default=None, help="run for this long then exit")
     parser.add_argument("--interval", default="1m", help="backtest candle interval")
@@ -236,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="funding: USDC amount, defaults to the full source balance")
     parser.add_argument("--to-spot", action="store_true",
                         help="funding: move perp -> spot instead of spot -> perp")
+    parser.add_argument("--runs", type=int, default=3,
+                        help="llm-check: how many prompts to send")
     args = parser.parse_args(argv)
 
     try:
@@ -250,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_backtest(cfg, args.interval, args.hours)
     if args.command == "funding":
         return cmd_funding(cfg, args.amount, to_perp=not args.to_spot)
+    if args.command == "llm-check":
+        return cmd_llm_check(cfg, args.runs)
     override = "live" if args.command == "live" else "paper"
     return cmd_run(cfg, override, args.seconds)
 

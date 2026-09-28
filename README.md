@@ -228,8 +228,28 @@ HL_INTERVAL=30                # free models are slow and rate limited
 Then verify before trusting it:
 
 ```bash
+python -m hlperp llm-check --runs 3
 python -m hlperp paper --seconds 60   # watch the tick lines
 ```
+
+`llm-check` sends the real prompt to the configured endpoint and reports whether
+each call produced usable JSON, plus latency and token counts:
+
+```
+model        google/gemma-4-31b-it:free
+endpoint     https://openrouter.ai/api/v1
+json_mode    False
+run 1   ok   up=0.630 buy        842ms tok=137    bid stacked, funding low
+run 2   FAIL up=0.611 buy          1ms tok=1      fallback: no JSON object in reply...
+run 3   ok   up=0.580 sell       903ms tok=137    offer heavy into funding
+result       2/3 answered
+latency      median=842ms max=903ms
+             -> intermittent failures; raise HL_INTERVAL to reduce them
+```
+
+Exit codes: `0` at least one call worked, `1` every call failed, `2` the config
+is wrong. Run it whenever you change `HL_MODEL_ID`; it is the difference between
+"the bot uses AI" and "the bot quietly uses momentum".
 
 Three things decide whether a free model actually works here:
 

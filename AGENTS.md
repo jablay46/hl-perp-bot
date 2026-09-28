@@ -36,6 +36,7 @@ PYTHONPATH=src python -m hlperp doctor
 PYTHONPATH=src python -m hlperp paper --seconds 30
 PYTHONPATH=src python -m hlperp backtest --interval 1m --hours 6
 PYTHONPATH=src python -m hlperp funding            # USDC spot -> perp
+PYTHONPATH=src python -m hlperp llm-check          # validate the LLM endpoint
 ```
 
 There is no test config; tests import `hlperp` from `src`, so `PYTHONPATH=src`

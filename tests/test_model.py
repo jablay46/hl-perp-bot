@@ -152,3 +152,24 @@ def test_create_model_defaults_to_momentum_without_a_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cfg = load_config()
     assert isinstance(create_model(cfg), MomentumModel)
+
+
+def test_llm_check_exit_codes(monkeypatch, capsys):
+    """llm-check must fail loudly when the endpoint is unusable."""
+    from hlperp.cli import cmd_llm_check
+    from hlperp.config import load_config
+
+    # momentum needs no endpoint, so it is always "fine".
+    monkeypatch.setenv("HL_MODEL", "momentum")
+    assert cmd_llm_check(load_config(), 1) == 0
+
+    # openai without a key is a configuration error.
+    monkeypatch.setenv("HL_MODEL", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert cmd_llm_check(load_config(), 1) == 2
+
+    # an unreachable endpoint means every call falls back: not ok.
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
+    assert cmd_llm_check(load_config(), 1) == 1
+    assert "every call failed" in capsys.readouterr().out
