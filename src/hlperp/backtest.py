@@ -94,15 +94,29 @@ class Backtester:
         looking like it ran. Offline (candles injected, no network) fall back to the
         perp ceiling of 6, which never over-truncates.
         """
-        if self.sz_decimals is None:
-            try:
-                meta = self._info().meta()
-                self.sz_decimals = next(
-                    a["szDecimals"] for a in meta["universe"] if a["name"] == self.cfg.coin
-                )
-            except Exception:  # pragma: no cover - network
-                self.sz_decimals = MAX_DECIMALS_PERP
-        return self.sz_decimals
+        if self.sz_decimals is not None:
+            return self.sz_decimals
+        try:
+            meta = self._info().meta()
+        except Exception as exc:  # pragma: no cover - network
+            # Do not cache the fallback: a transient failure must not lock this
+            # object to a coarse lot for the rest of its life.
+            log.warning(
+                "could not fetch asset metadata (%s); falling back to %d decimals for "
+                "sizing. Orders may be over-counted versus the real venue lot size.",
+                exc, MAX_DECIMALS_PERP,
+            )
+            return MAX_DECIMALS_PERP
+        # An unknown coin is a caller error, not a network problem: raising here
+        # beats silently sizing every order at the wrong precision.
+        for asset in meta["universe"]:
+            if asset["name"] == self.cfg.coin:
+                self.sz_decimals = int(asset["szDecimals"])
+                return self.sz_decimals
+        raise ValueError(
+            f"{self.cfg.coin!r} is not in the exchange's perp universe; "
+            f"cannot determine its lot size"
+        )
 
     def fetch_candles(self, interval: str, lookback_ms: int) -> list[dict]:
         end_ms = int(_time.time() * 1000)

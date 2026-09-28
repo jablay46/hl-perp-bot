@@ -20,7 +20,11 @@ from .config import ConfigError, load_config
 from .execution import LiveBroker, PaperBroker
 from .market import MarketData
 from .model import create_model
-from .risk import min_equity_for_order, min_order_notional
+from .risk import (
+    effective_target_notional,
+    min_equity_for_order,
+    min_order_notional,
+)
 from .server import Server
 from .trader import Trader
 
@@ -233,16 +237,25 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
             else:
                 sz_decimals = market.sz_decimals
                 px_guess = market.fetch_ctx().mark_px
-                need = min_equity_for_order(cfg.risk_pct, cfg.leverage, px_guess, sz_decimals)
-                target = equity * cfg.risk_pct * cfg.leverage
-                if target < min_order_notional(px_guess, sz_decimals):
+                need = min_equity_for_order(cfg.risk_pct, cfg.leverage, px_guess,
+                                            sz_decimals, cfg.max_notional_pct)
+                # Same formula the risk engine sizes with, so the warning cannot
+                # disagree with what the loop will actually attempt.
+                target = effective_target_notional(
+                    equity, cfg.risk_pct, cfg.leverage, cfg.max_notional_pct
+                )
+                floor_ntl = min_order_notional(px_guess, sz_decimals)
+                if target < floor_ntl:
+                    capped = (equity * cfg.max_notional_pct / 100.0
+                              <= equity * cfg.risk_pct * cfg.leverage)
                     print(
                         f"WARNING: accountValue={equity:.2f} is too small to trade. "
                         f"Target order is ${target:.2f}, below the smallest order this "
-                        f"coin accepts (${min_order_notional(px_guess, sz_decimals):.2f} "
-                        f"at {sz_decimals} decimals). At HL_LEVERAGE={cfg.leverage} and "
-                        f"HL_RISK_PCT={cfg.risk_pct} you need about ${need:.0f}. "
-                        f"Every order will be rejected.",
+                        f"coin accepts (${floor_ntl:.2f} at {sz_decimals} decimals). "
+                        f"At HL_LEVERAGE={cfg.leverage}, HL_RISK_PCT={cfg.risk_pct} and "
+                        f"HL_MAX_NOTIONAL_PCT={cfg.max_notional_pct}"
+                        + (" (the cap binds here)" if capped else "")
+                        + f", you need about ${need:.0f}. Every order will be rejected.",
                         file=sys.stderr,
                     )
         except Exception as exc:
