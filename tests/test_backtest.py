@@ -46,3 +46,24 @@ def test_backtest_requires_enough_candles(monkeypatch):
         assert "candles" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError")
+
+
+def test_backtest_respects_lot_size_and_venue_minimum(monkeypatch):
+    """A $200 account at BTC's 5-decimal lot sizes to $9.96 and must not order.
+
+    Regression: the backtest used to hardcode 2 decimals, so sizes were silently
+    rounded to a different lot than the venue enforces.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="IOC",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_RISK_PCT=0.01, HL_LEVERAGE=5, HL_MAX_LEVERAGE=10)
+    closes = [83000 + i * 5 for i in range(30)]
+    small = Backtester(cfg, base_equity=200.0, sz_decimals=5)
+    res_small = small.run(candles=_candles(closes), funding=[])
+    assert res_small.orders == 0  # below the $10 minimum at this lot size
+    assert res_small.fills == 0
+
+    # The same replay with enough equity does trade.
+    big = Backtester(cfg, base_equity=100_000.0, sz_decimals=5)
+    res_big = big.run(candles=_candles(closes), funding=[])
+    assert res_big.orders > 0

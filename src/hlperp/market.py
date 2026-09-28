@@ -32,6 +32,9 @@ def _levels(raw: list[dict]) -> list[Level]:
 
 
 class MarketData:
+    PING_AFTER_S = 20.0
+    STALE_AFTER_S = 45.0
+
     def __init__(self, network: str, coin: str) -> None:
         self.network = network
         self.coin = coin
@@ -148,15 +151,26 @@ class MarketData:
                 with ws_client.connect(url, open_timeout=10, close_timeout=5) as ws:
                     self._send_subs(ws)
                     backoff = 1.0
-                    last_ping = time.time()
+                    last_msg = time.time()
+                    ping_sent = 0.0
                     while not self._stop.is_set():
                         try:
                             msg = ws.recv(timeout=5)
                         except TimeoutError:
-                            if time.time() - last_ping > 20:
+                            now = time.time()
+                            silent = now - last_msg
+                            if silent > self.PING_AFTER_S and now - ping_sent > self.PING_AFTER_S:
                                 ws.send(json.dumps({"method": "ping"}))
-                                last_ping = time.time()
+                                ping_sent = now
+                            # A half-open socket accepts the ping but never answers.
+                            # Without this the loop keeps timing out forever and the
+                            # book/ctx go stale while the bot still looks connected.
+                            if silent > self.STALE_AFTER_S:
+                                raise RuntimeError(
+                                    f"no websocket data for {silent:.0f}s; reconnecting"
+                                )
                             continue
+                        last_msg = time.time()
                         self._handle(json.loads(msg))
             except Exception as exc:  # pragma: no cover - network
                 log.warning("ws disconnected (%s); retrying in %.0fs", exc, backoff)

@@ -15,12 +15,41 @@ short. Maintenance leverage is conservatively approximated for a single tier.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 from .config import Config
+from .rounding import floor_sz
 
 log = logging.getLogger("hlperp.risk")
+
+# Hyperliquid rejects any order whose value is below this, with ``MinTradeNtl``.
+# The boundary is exact: 10 is accepted, 9.99 is not.
+MIN_ORDER_NOTIONAL = 10.0
+
+
+def min_order_notional(px: float, sz_decimals: int) -> float:
+    """The smallest order value Hyperliquid will accept at this lot size.
+
+    Not simply $10: the size must be a whole number of lots, so the minimum is the
+    first lot multiple whose value reaches $10. At BTC's 5 decimals and $83k that
+    is 0.00013 BTC = $10.79, which is why an account sized for exactly $10 is
+    rejected.
+    """
+    if px <= 0 or sz_decimals < 0:
+        return MIN_ORDER_NOTIONAL
+    lot = 10.0 ** (-sz_decimals)
+    lots = math.ceil(MIN_ORDER_NOTIONAL / (px * lot))
+    return lots * lot * px
+
+
+def min_equity_for_order(risk_pct: float, leverage: int, px: float, sz_decimals: int) -> float:
+    """Equity needed before a single order clears the venue minimum."""
+    per_equity = risk_pct * leverage
+    if per_equity <= 0:
+        return float("inf")
+    return min_order_notional(px, sz_decimals) / per_equity
 
 
 @dataclass
@@ -107,6 +136,7 @@ class RiskEngine:
         px: float,
         exchange_max_leverage: float,
         current_position: Optional[object] = None,
+        sz_decimals: Optional[int] = None,
     ) -> RiskDecision:
         """Size the next order as the delta toward a target exposure.
 
@@ -115,6 +145,10 @@ class RiskEngine:
         and clipped so we never request more than the exchange's max leverage
         allows. The returned size is the *difference* from the position already
         held, so repeat ticks with an unchanged model do not stack.
+
+        When ``sz_decimals`` is given the size is lot-truncated and checked against
+        Hyperliquid's $10 minimum here, because the exchange would otherwise reject
+        the order and the loop would look healthy while never trading.
         """
         if self.check_kill_switch(equity):
             return RiskDecision(False, 0.0, f"halted: {self.halt_reason}")
@@ -144,7 +178,33 @@ class RiskEngine:
 
         order_side = "buy" if delta > 0 else "sell"
         size = abs(delta) / px
+        if sz_decimals is not None:
+            size = floor_sz(size, sz_decimals)
+            if size <= 0:
+                return RiskDecision(
+                    False, 0.0,
+                    f"size rounds to 0 at {sz_decimals} decimals (target ${abs(delta):.2f})",
+                )
         resulting_notional = abs(cur_signed + delta)
+        order_notional = size * px
+        if order_notional < MIN_ORDER_NOTIONAL:
+            if sz_decimals is not None:
+                need = min_equity_for_order(self.cfg.risk_pct, self.cfg.leverage, px, sz_decimals)
+                hint = (
+                    f"a whole lot is ${px * 10.0 ** -sz_decimals:.2f}, so the smallest "
+                    f"acceptable order is ${min_order_notional(px, sz_decimals):.2f}; "
+                    f"need about ${need:.0f} equity"
+                )
+            else:
+                need = MIN_ORDER_NOTIONAL / max(self.cfg.risk_pct * self.cfg.leverage, 1e-9)
+                hint = f"need about ${need:.0f} equity"
+            return RiskDecision(
+                False, 0.0,
+                f"order ${order_notional:.2f} is below Hyperliquid's "
+                f"${MIN_ORDER_NOTIONAL:.0f} minimum ({hint} at HL_LEVERAGE="
+                f"{self.cfg.leverage}, HL_RISK_PCT={self.cfg.risk_pct})",
+                notional=order_notional,
+            )
         # Resulting margin must fit inside equity at the requested leverage.
         if resulting_notional / self.cfg.leverage > equity:
             return RiskDecision(

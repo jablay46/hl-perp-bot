@@ -20,6 +20,7 @@ from .config import ConfigError, load_config
 from .execution import LiveBroker, PaperBroker
 from .market import MarketData
 from .model import create_model
+from .risk import min_equity_for_order, min_order_notional
 from .server import Server
 from .trader import Trader
 
@@ -217,17 +218,33 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
 
     market, account, broker, model = _build(cfg)
     if cfg.is_live:
-        # An unfunded account produces rejects that look like a broken strategy.
-        # Say so once, clearly, before the loop starts.
+        # Two failure modes produce identical-looking rejects, so name them up front:
+        # an empty account, and an account too small for Hyperliquid's $10 minimum.
         try:
             start_state = account.state(cfg.coin)
-            if start_state.account_value <= 0:
+            equity = start_state.account_value
+            if equity <= 0:
                 print(
                     f"WARNING: live account {cfg.account_address} has accountValue="
-                    f"{start_state.account_value}. No order can be placed. Fund it first "
-                    f"(testnet faucet) or the strategy will only log rejects.",
+                    f"{equity}. No order can be placed. Fund it first (testnet faucet) "
+                    f"or the strategy will only log rejects.",
                     file=sys.stderr,
                 )
+            else:
+                sz_decimals = market.sz_decimals
+                px_guess = market.fetch_ctx().mark_px
+                need = min_equity_for_order(cfg.risk_pct, cfg.leverage, px_guess, sz_decimals)
+                target = equity * cfg.risk_pct * cfg.leverage
+                if target < min_order_notional(px_guess, sz_decimals):
+                    print(
+                        f"WARNING: accountValue={equity:.2f} is too small to trade. "
+                        f"Target order is ${target:.2f}, below the smallest order this "
+                        f"coin accepts (${min_order_notional(px_guess, sz_decimals):.2f} "
+                        f"at {sz_decimals} decimals). At HL_LEVERAGE={cfg.leverage} and "
+                        f"HL_RISK_PCT={cfg.risk_pct} you need about ${need:.0f}. "
+                        f"Every order will be rejected.",
+                        file=sys.stderr,
+                    )
         except Exception as exc:
             print(f"WARNING: could not read account state: {exc}", file=sys.stderr)
     server = Server(
@@ -258,9 +275,6 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
     try:
         while not trader._stop:
             trader.tick()
-            for f in getattr(broker, "drain_fills", lambda: [])():
-                trader._apply_fill(f)
-                server.fill(f)
             if seconds and time.time() - start >= seconds:
                 break
             time.sleep(cfg.interval_s)

@@ -22,6 +22,7 @@ from .config import Config
 from .execution import PaperBroker
 from .model import Model, create_model
 from .risk import RiskEngine
+from .rounding import MAX_DECIMALS_PERP
 from .strategy import _returns_bps
 from .types import Fill, MarketState, Position, Signal
 
@@ -68,10 +69,12 @@ class _FundingPoint:
 
 
 class Backtester:
-    def __init__(self, cfg: Config, model: Model | None = None, base_equity: float = 10_000.0) -> None:
+    def __init__(self, cfg: Config, model: Model | None = None, base_equity: float = 10_000.0,
+                 sz_decimals: int | None = None) -> None:
         self.cfg = cfg
         self.model = model or create_model(cfg)
         self.base_equity = base_equity
+        self.sz_decimals = sz_decimals
         self.risk = RiskEngine(cfg)
         self.broker = PaperBroker(cfg.coin, participation=1.0)
 
@@ -82,6 +85,24 @@ class Backtester:
 
         base = constants.TESTNET_API_URL if self.cfg.network == "testnet" else constants.MAINNET_API_URL
         return Info(base, skip_ws=True)
+
+    def resolve_sz_decimals(self) -> int:
+        """The asset's lot precision, so sizes are truncated the way the venue does.
+
+        A hardcoded value is worse than none: an interval finer than the real lot
+        size truncates every order to zero and the backtest reports no fills while
+        looking like it ran. Offline (candles injected, no network) fall back to the
+        perp ceiling of 6, which never over-truncates.
+        """
+        if self.sz_decimals is None:
+            try:
+                meta = self._info().meta()
+                self.sz_decimals = next(
+                    a["szDecimals"] for a in meta["universe"] if a["name"] == self.cfg.coin
+                )
+            except Exception:  # pragma: no cover - network
+                self.sz_decimals = MAX_DECIMALS_PERP
+        return self.sz_decimals
 
     def fetch_candles(self, interval: str, lookback_ms: int) -> list[dict]:
         end_ms = int(_time.time() * 1000)
@@ -109,6 +130,7 @@ class Backtester:
 
         mids: list[float] = []
         equity = self.base_equity
+        sz_decimals = self.resolve_sz_decimals()
         self.risk.observe_equity(equity)
         peak = max_dd = 0.0
         fees = funding_paid = realized = 0.0
@@ -176,6 +198,7 @@ class Backtester:
                 want, equity, close,
                 exchange_max_leverage=self.cfg.max_leverage,
                 current_position=self._position_view(close),
+                sz_decimals=sz_decimals,
             )
             if not size_dec.allowed:
                 continue
@@ -187,7 +210,7 @@ class Backtester:
             if tif == "ALO" and ((order_side == "buy" and px >= close) or (order_side == "sell" and px <= close)):
                 continue  # post-only would cross: rejected
             res = self.broker.place(Signal(self.cfg.coin, order_side, tif, px),
-                                    size_dec.size, close, 2)
+                                    size_dec.size, close, sz_decimals)
             orders += 1
             if tif == "ALO" and res.status == "resting":
                 pending_px, pending_side = px, order_side

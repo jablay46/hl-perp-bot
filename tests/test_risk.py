@@ -1,5 +1,12 @@
 from hlperp.config import load_config
-from hlperp.risk import RiskEngine, liquidation_price
+from hlperp.risk import (
+    MIN_ORDER_NOTIONAL,
+    RiskEngine,
+    liquidation_price,
+    min_equity_for_order,
+    min_order_notional,
+)
+from hlperp.rounding import floor_sz
 from hlperp.types import Position
 
 
@@ -100,3 +107,40 @@ def test_sizing_blocked_when_halted(monkeypatch):
     r.check_kill_switch(900)
     d = r.size("buy", equity=900, px=100.0, exchange_max_leverage=10)
     assert d.allowed is False and "halted" in d.reason
+
+
+def test_sizing_refuses_order_below_venue_minimum(monkeypatch):
+    """A $7 account sizes to $0.35: the venue rejects it, so we must refuse first."""
+    cfg = _cfg(monkeypatch, HL_RISK_PCT=0.01, HL_LEVERAGE=5, HL_MAX_LEVERAGE=10,
+               HL_MAX_NOTIONAL_PCT=50, HL_MAX_DRAWDOWN_PCT=99, HL_MIN_LIQ_DISTANCE_PCT=0)
+    r = RiskEngine(cfg)
+    d = r.size("buy", equity=7.0, px=83_000.0, exchange_max_leverage=10, sz_decimals=5)
+    assert d.allowed is False
+    assert "minimum" in d.reason or "rounds to 0" in d.reason
+    # The 5-decimal lot means a whole lot is not $10 but ~$10.79.
+    assert abs(min_order_notional(83_000.0, 5) - 0.00013 * 83_000.0) < 1e-6
+
+
+def test_sizing_allows_order_once_equity_clears_minimum(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_RISK_PCT=0.01, HL_LEVERAGE=5, HL_MAX_LEVERAGE=10,
+               HL_MAX_NOTIONAL_PCT=50, HL_MAX_DRAWDOWN_PCT=99, HL_MIN_LIQ_DISTANCE_PCT=0)
+    r = RiskEngine(cfg)
+    px = 83_000.0
+    need = min_equity_for_order(0.01, 5, px, 5)
+    below = r.size("buy", equity=need - 20, px=px, exchange_max_leverage=10, sz_decimals=5)
+    at = r.size("buy", equity=need + 1, px=px, exchange_max_leverage=10, sz_decimals=5)
+    assert below.allowed is False
+    assert at.allowed is True
+    # The size must survive lot truncation at $10 or above.
+    assert floor_sz(at.size, 5) * px >= MIN_ORDER_NOTIONAL
+
+
+def test_sizing_delta_is_lot_truncated_not_rounded_up(monkeypatch):
+    """The returned size must never exceed the notional the risk budget allowed."""
+    cfg = _cfg(monkeypatch, HL_RISK_PCT=0.01, HL_LEVERAGE=5, HL_MAX_LEVERAGE=10,
+               HL_MAX_NOTIONAL_PCT=50, HL_MAX_DRAWDOWN_PCT=99, HL_MIN_LIQ_DISTANCE_PCT=0)
+    r = RiskEngine(cfg)
+    px = 1_234.56
+    d = r.size("buy", equity=10_000.0, px=px, exchange_max_leverage=10, sz_decimals=3)
+    assert d.allowed
+    assert floor_sz(d.size, 3) * px <= 10_000 * 0.01 * 5 + 1e-6

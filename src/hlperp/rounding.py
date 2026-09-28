@@ -12,16 +12,26 @@ than discovering the problem as a rejection.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 MAX_DECIMALS_PERP = 6
 
 
-def round_sz(size: float | str, sz_decimals: int) -> float:
-    """Round a size to the asset's lot size."""
+def floor_sz(size: float | str, sz_decimals: int) -> float:
+    """Truncate a size down to the asset's lot size.
+
+    Truncation, never rounding up: a size rounded up can exceed the balance or
+    the intended notional and the exchange rejects the whole order. Hyperliquid's
+    own SDK example floors for the same reason.
+    """
     d = Decimal(str(size))
     quantum = Decimal(1).scaleb(-sz_decimals)
-    return float(d.quantize(quantum, rounding=ROUND_HALF_UP))
+    return float(d.quantize(quantum, rounding=ROUND_DOWN))
+
+
+# Sizes are lot-truncated. Kept under the ``round_sz`` name so call sites read as
+# "snap to the exchange's lot size"; the semantics are floor, not round-half-up.
+round_sz = floor_sz
 
 
 def round_px(price: float | str, sz_decimals: int) -> float:

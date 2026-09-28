@@ -120,6 +120,9 @@ class Trader:
             self._seen_fills.add(key)
             if ts > self._last_fill_ts:
                 self._last_fill_ts = ts
+            # Filter before applying: a fill for another coin must not reach totals.
+            if r.get("coin", self.cfg.coin) != self.cfg.coin:
+                continue
             fill = Fill(
                 coin=r.get("coin", self.cfg.coin),
                 side="buy" if r.get("side") == "B" else "sell",
@@ -132,8 +135,6 @@ class Trader:
                 crossed=bool(r.get("crossed", False)),
                 hash=str(r.get("hash", "")),
             )
-            if fill.coin != self.cfg.coin:
-                continue
             self._apply_fill(fill)
             out.append(fill)
         return out
@@ -285,6 +286,7 @@ class Trader:
                 sig.limit_px,
                 exchange_max_leverage=self.market.max_leverage,
                 current_position=pos_view,
+                sz_decimals=self.market.sz_decimals,
             )
             if size_dec.allowed:
                 # The risk engine may flip the side (e.g. an existing long that

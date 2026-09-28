@@ -131,7 +131,10 @@ class Strategy:
         """Build the order intent for the model's side."""
         side = "buy" if decision_action == "buy" else "sell"
         mid = book.mid
-        assert mid is not None
+        if mid is None:
+            # An assert here would vanish under -O and then silently build an order
+            # at nan. Raise instead so the caller sees a real failure.
+            raise ValueError("signal_for called with a book that has no mid price")
         half = self.cfg.spread_bps / 10_000
         if self.cfg.order_tif == "ALO":
             # Join the near touch on our own side: the best bid for a buy, the

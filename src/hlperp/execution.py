@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from .rounding import round_px, round_sz
+from .risk import MIN_ORDER_NOTIONAL
 from .types import Fill, OrderResult, Signal, Side
 
 log = logging.getLogger("hlperp.exec")
@@ -247,6 +248,12 @@ class PaperBroker:
     def place(self, sig: Signal, sz: float, mark_px: float, sz_decimals: int) -> OrderResult:
         px = round_px(sig.limit_px, sz_decimals)
         sz = round_sz(sz, sz_decimals)
+        if sz <= 0 or sz * px < MIN_ORDER_NOTIONAL:
+            return OrderResult(
+                sig.coin, sig.side, px, sz, sig.tif.upper(), None, "rejected",
+                f"order ${sz * px:.2f} is below Hyperliquid's "
+                f"${MIN_ORDER_NOTIONAL:.0f} minimum", {},
+            )
         tif = sig.tif.upper()
         if tif == "ALO":
             # Post-only: if the price would cross, the venue cancels it instead.
@@ -381,9 +388,15 @@ class PaperBroker:
             pos.realized += closed_pnl
         if new_size == 0:
             pos.entry_px = 0.0
-        elif (pos.size > 0) == (signed > 0) or pos.size == 0:
+        elif pos.size == 0 or (pos.size > 0) == (signed > 0):
+            # Adding to the position: blend the entry price over the combined size.
             total = abs(pos.size) + abs(signed)
             pos.entry_px = (pos.entry_px * abs(pos.size) + px * abs(signed)) / total
+        else:
+            # Flipped through zero: the remainder is a brand-new position, so its
+            # entry is this fill's price. Leaving the old entry makes unrealized PnL
+            # and every later close wrong.
+            pos.entry_px = px
         pos.size = new_size
         rate = self.taker_rate if crossed else self.maker_rate
         fee = sz * px * rate

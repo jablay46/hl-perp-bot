@@ -99,3 +99,35 @@ def test_paper_fees_are_charged():
     fill = b2.on_print("BTC", 98.5, 1, is_buy=False)[0]
     expected_maker = 1.0 * 99.0 * 1.5 / 10_000
     assert abs(fill.fee - expected_maker) < 1e-9
+
+
+def test_paper_rejects_order_below_venue_minimum():
+    """The paper venue must enforce the same $10 minimum as the real one."""
+    b = PaperBroker("BTC")
+    r = b.place(_sig("buy", "ALO", 99.0), sz=0.0001, mark_px=100.0, sz_decimals=5)
+    assert r.status == "rejected"
+    assert "minimum" in (r.error or "")
+    assert b.open_orders("BTC") == []
+
+
+def test_paper_entry_price_resets_after_flip():
+    """Flipping through zero opens a new position at the fill price, not the old entry."""
+    b = PaperBroker("BTC")
+    b.place(_sig("buy", "IOC", 100.0), 5.0, 100.0, 5)
+    # Sell 8: closes the 5 long and opens a 3 short at ~120.
+    b.place(_sig("sell", "IOC", 120.0), 8.0, 120.0, 5)
+    pos = b.position("BTC")
+    assert pos.size < 0
+    assert abs(pos.entry_px - 120.0) < 1.0
+    # Marked at the flip price the new short has no unrealized PnL.
+    assert abs(b.unrealized("BTC", pos.entry_px)) < 1e-9
+
+
+def test_paper_entry_price_blends_when_adding():
+    b = PaperBroker("BTC")
+    b.place(_sig("buy", "IOC", 100.0), 1.0, 100.0, 5)
+    b.place(_sig("buy", "IOC", 200.0), 1.0, 200.0, 5)
+    pos = b.position("BTC")
+    assert pos.size == 2.0
+    # Simple average because both adds are the same size, before slippage.
+    assert 100.0 < pos.entry_px < 205.0
