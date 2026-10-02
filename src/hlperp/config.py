@@ -57,6 +57,9 @@ class Config:
     min_liq_distance_pct: float
     max_notional_pct: float
     hold_signal: float
+    maker_bps: float
+    taker_bps: float
+    slippage_bps: float
     trigger_buffer_bps: float
     tp_sl_enabled: bool
     tp_pct: float
@@ -107,6 +110,10 @@ class Config:
             raise ConfigError("HL_MAINTENANCE_LEVERAGE must be > 0")
         if self.hold_signal < 0:
             raise ConfigError("HL_HOLD_SIGNAL must be >= 0 (0 disables the hold band)")
+        if self.maker_bps < 0 or self.taker_bps < 0 or self.slippage_bps < 0:
+            raise ConfigError(
+                "HL_MAKER_BPS, HL_TAKER_BPS and HL_SLIPPAGE_BPS must be >= 0"
+            )
         if self.leverage < 1 or self.leverage > self.max_leverage:
             raise ConfigError(
                 f"HL_LEVERAGE={self.leverage} must be between 1 and HL_MAX_LEVERAGE={self.max_leverage}"
@@ -158,6 +165,9 @@ def load_config() -> Config:
         min_liq_distance_pct=_float("HL_MIN_LIQ_DISTANCE_PCT", 15.0),
         max_notional_pct=_float("HL_MAX_NOTIONAL_PCT", 50.0),
         hold_signal=_float("HL_HOLD_SIGNAL", 0.3),
+        maker_bps=_float("HL_MAKER_BPS", 1.5),
+        taker_bps=_float("HL_TAKER_BPS", 4.5),
+        slippage_bps=_float("HL_SLIPPAGE_BPS", 2.0),
         trigger_buffer_bps=_float("HL_TRIGGER_BUFFER_BPS", 5.0),
         tp_sl_enabled=_bool("HL_TP_SL", False),
         tp_pct=_float("HL_TP_PCT", 0.02),

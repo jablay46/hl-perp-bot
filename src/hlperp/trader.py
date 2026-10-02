@@ -52,6 +52,14 @@ class TEvent:
 
 
 class Trader:
+    # A book older than this is not a market view, it is a memory. The websocket
+    # liveness policy in ``market.py`` reconnects after ``STALE_AFTER_S`` of silence,
+    # but until that fires the last ``Book`` stays in place looking perfectly valid,
+    # so a decision could be priced off a book from minutes ago. QuantDinger's circuit
+    # breaker is the same idea at the data-source level: stop acting on a source that
+    # is not currently answering.
+    MAX_BOOK_AGE_MS = 10_000
+
     def __init__(
         self,
         cfg: Config,
@@ -74,6 +82,7 @@ class Trader:
         self.history: list[TEvent] = []
         self.totals = {
             "ticks": 0, "decisions": 0, "orders": 0, "rejected": 0, "holds": 0,
+            "stale_skips": 0,
             "fills": 0, "fees": 0.0, "funding": 0.0, "realized": 0.0,
             "starting_equity": 0.0, "last_equity": 0.0,
         }
@@ -231,6 +240,15 @@ class Trader:
         book = self.market.book
         ctx = self.market.ctx
         if book is None or ctx is None or book.mid is None:
+            return None
+        # Refuse to trade on a book the venue has stopped updating. A stale book still
+        # has a valid mid and spread, so nothing downstream would notice; the model
+        # would price a decision off it and the order would go to a market that moved.
+        book_age_ms = int(time.time() * 1000) - int(book.ts)
+        if book_age_ms > self.MAX_BOOK_AGE_MS:
+            self.totals["stale_skips"] += 1
+            log.warning("book is %dms old (> %dms); skipping tick",
+                        book_age_ms, self.MAX_BOOK_AGE_MS)
             return None
 
         state = self.account.state(self.cfg.coin)
@@ -447,6 +465,7 @@ class Trader:
             "orders": self.totals["orders"],
             "rejected": self.totals["rejected"],
             "holds": self.totals["holds"],
+            "stale_skips": self.totals["stale_skips"],
             "fills": self.totals["fills"],
             "fees": round(self.totals["fees"], 6),
             "funding": round(self.totals["funding"], 6),

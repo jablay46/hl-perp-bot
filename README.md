@@ -159,6 +159,13 @@ checked against the next candle's range, funding is charged at the historical
 hourly rate, and the report includes return, max drawdown and win rate. It is
 deliberately conservative: no fill is assumed better than the quote.
 
+The backtester **refuses to run against an LLM** unless you insist. Replaying a
+period through a model trained on that period measures recall, not edge: the
+model already knows how the move ended, so the equity curve is fiction. With
+`HL_MODEL=openai` it raises rather than mislead you; `--allow-live-model` is the
+deliberate override, and it only makes sense for a model with a hard knowledge
+cutoff before the window you replay.
+
 ### Funding, accounted honestly
 
 Hyperliquid pays funding **hourly** at `funding = premium + clamp(interest −
@@ -176,6 +183,23 @@ side, and at the floor the term is zero. Two regimes matter — at or near the
 floor the edge has to come from price and flow, while a rate well above it is a
 carry cost that a position has to clear. `funding_apr` is stored as a
 **fraction** (0.1095), so any display multiplies by 100 before adding `%`.
+
+### Costs are modelled, not assumed away
+
+The paper broker charges the maker rate on a resting fill and the taker rate plus
+slippage on a cross, and both come from `HL_MAKER_BPS` / `HL_TAKER_BPS` /
+`HL_SLIPPAGE_BPS`. The defaults are Hyperliquid's standard 1.5/4.5 bps. If your
+account pays a different tier, set them: a strategy judged against the wrong fee
+is judged against nothing, and every backtest number moves with them.
+
+### Stale data is not a market view
+
+A websocket that goes quiet leaves the last book in place, and that book still has
+a perfectly valid mid and spread. `market.py` reconnects after 45s of silence, but
+in the meantime nothing downstream can tell the difference. So `tick()` refuses to
+price a decision off a book older than 10 seconds, counts it under `stale_skips`,
+and sends no order. A tick that trades on a price the market has left behind is
+worse than a tick that does nothing.
 
 ---
 
@@ -214,6 +238,9 @@ python -m hlperp paper --seconds 60    # bounded run, useful for CI/smoke
 | `HL_MAX_DRAWDOWN_PCT` | `10` | kill-switch threshold |
 | `HL_MIN_LIQ_DISTANCE_PCT` | `15` | refuse orders with liquidation closer than this |
 | `HL_HOLD_SIGNAL` | `0.3` | momentum: below this \|signal\| the model holds instead of trading; `0` disables |
+| `HL_MAKER_BPS` | `1.5` | maker fee assumed by the paper broker |
+| `HL_TAKER_BPS` | `4.5` | taker fee assumed by the paper broker |
+| `HL_SLIPPAGE_BPS` | `2.0` | assumed slippage on an IOC cross |
 | `HL_TP_SL` | `false` | arm a reduce-only take-profit / stop-loss bracket |
 | `HL_TP_PCT` / `HL_SL_PCT` | `0.02` / `0.01` | bracket distances from the mark |
 | `HL_INTERVAL` | `2.0` | seconds between decisions |
@@ -376,10 +403,11 @@ works for an address that already exists on mainnet.
 PYTHONPATH=src python -m pytest -q
 ```
 
-37 tests cover tick/lot rounding, the config interlock, liquidation maths, delta
+111 tests cover tick/lot rounding, the config interlock, liquidation maths, delta
 sizing and the kill-switch, paper matching (partial fills, TP/SL triggers) and
-fee accounting, live-fill reconciliation idempotence, the offline backtester, and
-a deterministic end-to-end loop (decision → risk → order → fill → P&L).
+fee accounting, live-fill reconciliation idempotence, the stale-book guard, the
+offline backtester (including its LLM-contamination refusal), and a deterministic
+end-to-end loop (decision → risk → order → fill → P&L).
 
 ---
 
@@ -390,6 +418,14 @@ a deterministic end-to-end loop (decision → risk → order → fill → P&L).
 - Per-asset margin tiers rather than a single maintenance-leverage approximation.
 - Reconnect reconciliation against `openOrders`/`clearinghouseState`.
 - Multi-market, isolated margin per market.
+- Volatility-scaled sizing: express the stop as a multiple of ATR and size to a
+  fixed equity fraction, so risk per trade is constant across regimes instead of
+  constant in notional. (ai-hedge-fund's `risk/limits.py` is the reference.)
+- Confidence-gated routing: the model already returns a probability, but nothing
+  acts on how *certain* it is. Gate size or skip the trade when the distribution is
+  flat, and require a higher bar to open than to reduce. (TypeSafe `confidence`.)
+- Regime detection, so the momentum model is not asked to work in a chop it has
+  no edge in.
 
 ---
 
