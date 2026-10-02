@@ -16,7 +16,10 @@ class FakeMarket:
 
     def __init__(self) -> None:
         self.book = Book(
-            coin="BTC", ts=0,
+            # Fresh by default: the trader refuses to price a decision off a book
+            # the venue has stopped updating, so a fixture with a fixed old ts
+            # would silently skip every tick.
+            coin="BTC", ts=int(time.time() * 1000),
             bids=[Level(100.0, 5.0), Level(99.5, 5.0)],
             asks=[Level(100.2, 5.0), Level(100.5, 5.0)],
         )
@@ -413,4 +416,63 @@ def test_signal_for_taker_override_ignores_the_alo_default(monkeypatch):
     assert resting.limit_px < market.book.best_ask  # never crosses
     assert crossing.limit_px >= market.book.best_ask  # crosses the touch
     assert crossing.reduce_only is True and resting.reduce_only is False
+
+
+def test_stale_book_skips_the_tick_and_sends_no_order(monkeypatch):
+    """A book the venue stopped updating must not be priced into a decision.
+
+    The book still has a valid mid and spread, so nothing downstream would
+    notice; without this guard the model would decide off a market that has
+    already moved.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
+    trader.tick()
+    assert trader.totals["orders"] == 1
+
+    # Age the book past the guard and tick again: no new order, and the skip is counted.
+    market.book.ts = int(time.time() * 1000) - Trader.MAX_BOOK_AGE_MS - 1_000
+    orders_before = trader.totals["orders"]
+    event = trader.tick()
+    assert event is None
+    assert trader.totals["orders"] == orders_before
+    assert trader.totals["stale_skips"] == 1
+    # A skipped tick is not a decision: the model was never asked.
+    assert trader.totals["decisions"] == 1
+    view = trader._totals_view(AccountState(0.0, 0.0, 0.0, 0.0, None))
+    assert view["stale_skips"] == 1
+
+
+def test_a_fresh_book_still_trades(monkeypatch):
+    """The guard is a freshness bound, not a blanket refusal."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    market.book.ts = int(time.time() * 1000) - 1_000  # 1s old, well inside the bound
+    trader = Trader(cfg, market, Account("testnet", None), PaperBroker("BTC"),
+                    MomentumModel(min_signal=0))
+    trader.tick()
+    assert trader.totals["stale_skips"] == 0
+    assert trader.totals["orders"] == 1
+
+
+def test_configured_fee_rates_reach_the_paper_broker(monkeypatch):
+    """Fees are a modelled cost, not a hardcoded assumption.
+
+    A strategy judged on a wrong fee assumption is judged on nothing; the
+    defaults must be overridable and must actually reach the broker.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MAKER_BPS=0.0, HL_TAKER_BPS=9.0, HL_SLIPPAGE_BPS=5.0)
+    assert cfg.maker_bps == 0.0 and cfg.taker_bps == 9.0 and cfg.slippage_bps == 5.0
+    broker = PaperBroker(cfg.coin, maker_bps=cfg.maker_bps, taker_bps=cfg.taker_bps,
+                         slippage_bps=cfg.slippage_bps)
+    assert broker.maker_rate == 0.0
+    assert abs(broker.taker_rate - 9.0 / 10_000) < 1e-15
+    assert abs(broker.slippage - 5.0 / 10_000) < 1e-15
 

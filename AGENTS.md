@@ -150,6 +150,41 @@ is required (or install the package editable).
   on the resting quote's own side. Paper fills are also fractional, so a position
   can end a sub-lot remainder below the $10 minimum that no order can close.
 
+## Costs and data freshness
+
+- **Fees are configuration, not constants.** `HL_MAKER_BPS` / `HL_TAKER_BPS` /
+  `HL_SLIPPAGE_BPS` feed `PaperBroker` in both `cli.py` and `backtest.py`. Never
+  hardcode a rate at a call site: the paper loop and the backtest must be built
+  from the same assumptions, or their P&L diverges in a way nobody can see.
+- **`tick()` refuses a stale book.** `market.py` reconnects after 45s of silence,
+  but until then the last `Book` is still a valid object with a valid mid. The
+  `MAX_BOOK_AGE_MS` (10s) guard skips the tick and counts `stale_skips`. A test
+  fixture must set a fresh `book.ts`, or every tick is silently skipped.
+- **The backtester refuses an LLM by default.** Replaying a period through a model
+  trained on it measures recall, not edge. `Backtester(cfg)` raises for
+  `HL_MODEL=openai`; `allow_live_model=True` (CLI `--allow-live-model`) is the
+  deliberate override. Do not weaken this to make a demo work.
+
+## Research references for this bot
+
+Three external sources were studied for ideas worth porting; the applied ones are
+above, the rest are on the roadmap in `README.md`.
+
+- **ai-hedge-fund** (`virattt/ai-hedge-fund`) — `risk/limits.py` (volatility-scaled
+  sizing, correlation caps), `pipeline/stages.py` (staged pipeline with explicit
+  stage contracts), `signals/llm_agent.py` (`blind` mode: a backtest snapshot
+  withholds ticker, dates and dollar values so the model cannot recall the answer).
+  The `blind` idea is what the backtest guard implements.
+- **QuantDinger** (`OpenByteInc/QuantDinger`) — `risk_guard.py` (pre-trade limits),
+  `funding_reconciliation.py` (funding as a first-class ledger entry, not an
+  afterthought), `account_risk.py`, `ai_decision_filter.py`, and a data-source
+  circuit breaker. The circuit breaker is what the stale-book guard implements.
+- **TypeSafe** (`docs.typesafe.ai`) — `confidence` on every Choice/Score answer,
+  confidence-gated routing (act / review / escalate), composite scoring of atomic
+  questions, and speculative fan-out. The applicable idea here is gating on
+  confidence rather than only on direction: `Decision.probabilities` already
+  carries the distribution, nothing consumes its shape yet.
+
 ## Opening a PR in this repo
 
 - **`GITHUB_TOKEN` is a GitHub App token without pull-request write.** `gh pr
