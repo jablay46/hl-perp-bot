@@ -127,3 +127,45 @@ def test_explicit_sz_decimals_skips_metadata(monkeypatch):
     bt = Backtester(cfg, sz_decimals=4)
     monkeypatch.setattr(bt, "_info", lambda: (_ for _ in ()).throw(AssertionError("no fetch")))
     assert bt.resolve_sz_decimals() == 4
+
+
+def test_backtest_refuses_a_model_that_can_recall_the_period(monkeypatch):
+    """An LLM that has seen the past cannot honestly "predict" it.
+
+    Replaying history through a model trained on that history measures recall,
+    not edge, and the equity curve that comes out is fiction. The guard must
+    fire before any data is fetched.
+    """
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_MODEL="openai",
+               OPENAI_API_KEY="sk-test")
+    try:
+        Backtester(cfg)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "recall" in str(exc) or "honest" in str(exc)
+
+
+def test_backtest_guard_is_overridable_only_deliberately(monkeypatch):
+    """The escape hatch exists, but it is explicit and it is the caller's choice."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_MODEL="openai",
+               OPENAI_API_KEY="sk-test")
+    bt = Backtester(cfg, allow_live_model=True)
+    assert bt.model.name.startswith("openai:")
+
+
+def test_backtest_momentum_model_needs_no_override(monkeypatch):
+    """The default path is unaffected: the guard is specific to a recalling model."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_MODEL="momentum")
+    bt = Backtester(cfg)
+    assert bt.model.name == "momentum"
+
+
+def test_backtest_fee_rates_come_from_config(monkeypatch):
+    """Costs are modelled, so a backtest and the paper loop must agree on them."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper",
+               HL_MAKER_BPS=0.0, HL_TAKER_BPS=9.0, HL_SLIPPAGE_BPS=5.0)
+    bt = Backtester(cfg)
+    assert bt.broker.maker_rate == 0.0
+    assert abs(bt.broker.taker_rate - 9.0 / 10_000) < 1e-15
+    assert abs(bt.broker.slippage - 5.0 / 10_000) < 1e-15
+

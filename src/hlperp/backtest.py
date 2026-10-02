@@ -70,13 +70,30 @@ class _FundingPoint:
 
 class Backtester:
     def __init__(self, cfg: Config, model: Model | None = None, base_equity: float = 10_000.0,
-                 sz_decimals: int | None = None) -> None:
+                 sz_decimals: int | None = None, allow_live_model: bool = False) -> None:
         self.cfg = cfg
+        # A backtest must not ask a model that can recall the period being replayed.
+        # An LLM trained on the past knows how the move ended, so its "prediction"
+        # is recall, and the resulting equity curve is fiction. This is the same
+        # reason ai-hedge-fund's LLMAgent has a `blind` mode that withholds the
+        # ticker, dates and dollar values from a backtest snapshot.
+        if model is None and cfg.model == "openai" and not allow_live_model:
+            raise ValueError(
+                f"refusing to backtest HL_MODEL={cfg.model!r}: a model with knowledge of the "
+                "replay period cannot produce an honest result. Use HL_MODEL=momentum, or pass "
+                "allow_live_model=True if you understand the result is not evidence."
+            )
         self.model = model or create_model(cfg)
         self.base_equity = base_equity
         self.sz_decimals = sz_decimals
         self.risk = RiskEngine(cfg)
-        self.broker = PaperBroker(cfg.coin, participation=1.0)
+        self.broker = PaperBroker(
+            cfg.coin,
+            maker_bps=cfg.maker_bps,
+            taker_bps=cfg.taker_bps,
+            slippage_bps=cfg.slippage_bps,
+            participation=1.0,
+        )
 
     # -- data --------------------------------------------------------------
     def _info(self):

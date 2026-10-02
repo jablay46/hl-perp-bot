@@ -45,3 +45,21 @@ def test_leverage_bounds(monkeypatch):
         raise AssertionError("expected ConfigError")
     except ConfigError as exc:
         assert "HL_LEVERAGE" in str(exc)
+
+
+def test_negative_fee_rate_is_rejected(monkeypatch):
+    """A negative fee would pay us to trade and make every backtest a fantasy."""
+    monkeypatch.setenv("HL_TAKER_BPS", "-1")
+    try:
+        load_config()
+        raise AssertionError("expected ConfigError")
+    except ConfigError as exc:
+        assert "HL_MAKER_BPS" in str(exc) or "HL_TAKER_BPS" in str(exc)
+
+
+def test_fee_defaults_match_hyperliquid_tiers(monkeypatch):
+    """Defaults are the venue's standard maker/taker, overridable for a real tier."""
+    cfg = load_config()
+    assert cfg.maker_bps == 1.5
+    assert cfg.taker_bps == 4.5
+    assert cfg.slippage_bps == 2.0

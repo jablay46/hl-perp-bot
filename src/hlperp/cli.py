@@ -53,7 +53,12 @@ def _build(cfg):
         logging.info("LIVE mode: signer=%s account=%s agent=%s",
                      wallet.address, cfg.account_address, cfg.is_agent_wallet)
     else:
-        broker = PaperBroker(cfg.coin)
+        broker = PaperBroker(
+            cfg.coin,
+            maker_bps=cfg.maker_bps,
+            taker_bps=cfg.taker_bps,
+            slippage_bps=cfg.slippage_bps,
+        )
         logging.info("PAPER mode: real data, simulated fills, no keys")
 
     return market, account, broker, model
@@ -300,13 +305,13 @@ def cmd_run(cfg, mode_override: str | None, seconds: float | None) -> int:
     return 0
 
 
-def cmd_backtest(cfg, interval: str, hours: float) -> int:
+def cmd_backtest(cfg, interval: str, hours: float, allow_live_model: bool = False) -> int:
     import json
 
     from .backtest import Backtester
 
-    bt = Backtester(cfg)
     try:
+        bt = Backtester(cfg, allow_live_model=allow_live_model)
         result = bt.run(interval=interval, lookback_ms=int(hours * 3_600_000))
     except Exception as exc:
         print(f"backtest failed: {exc}", file=sys.stderr)
@@ -330,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="funding: move perp -> spot instead of spot -> perp")
     parser.add_argument("--runs", type=int, default=3,
                         help="llm-check: how many prompts to send")
+    parser.add_argument("--allow-live-model", action="store_true",
+                        help="backtest: permit an LLM that may recall the replay period "
+                             "(the result is not evidence)")
     args = parser.parse_args(argv)
 
     try:
@@ -341,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return cmd_doctor(cfg)
     if args.command == "backtest":
-        return cmd_backtest(cfg, args.interval, args.hours)
+        return cmd_backtest(cfg, args.interval, args.hours, args.allow_live_model)
     if args.command == "funding":
         return cmd_funding(cfg, args.amount, to_perp=not args.to_spot)
     if args.command == "llm-check":
