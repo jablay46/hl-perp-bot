@@ -92,14 +92,18 @@ perp accounts (funding and liquidation) modelled rather than ignored.
 2. **Assemble** a compact `MarketState`: mid, spread, funding (hourly and APR),
    open interest, book imbalance, depth by band, short-horizon returns, taker
    flow (CVD), and the current position.
-3. **Ask** the model for `P(mid higher after horizon)`. Above 0.5 is long.
+3. **Ask** the model for `P(mid higher after horizon)`. Above 0.5 is long. The
+   model may also answer `hold`; a hold sends no order and pulls any resting
+   quote, so a tick can legitimately do nothing.
 4. **Size** through the risk engine (see below). A denial is recorded, not
    traded around.
-5. **Quote.** With `HL_ORDER_TIF=ALO`, place a post-only limit that joins the near
-   touch on the model's side (best bid for a buy, best ask for a sell) and cancel
-   the previous one, so the bot earns the maker fee instead of paying the taker
-   fee and still rests when the spread is a single tick. With `IOC`, cross the
-   touch.
+5. **Quote.** An **entry** with `HL_ORDER_TIF=ALO` places a post-only limit that
+   joins the near touch on the model's side (best bid for a buy, best ask for a
+   sell) and cancels the previous one, so the bot earns the maker fee instead of
+   paying the taker fee and still rests when the spread is a single tick. An
+   **exit** that closes an open position is different: it is `reduce-only` and
+   crosses as a taker (`IOC`), because a quote you need to leave cannot wait for
+   someone to hit it. With `HL_ORDER_TIF=IOC`, entries cross the touch too.
 6. **Account.** Maker fills arrive from the exchange (live) or from the trade
    tape (paper). Fees are charged per fill; funding accrues on open notional at
    the hourly rate. Both show up in the dashboard P&L.
@@ -164,6 +168,15 @@ funding without counting it is flying blind. Here it accrues on
 `position_value * funding_hourly * sign * elapsed_hours` and appears as its own
 line in the dashboard, next to fees.
 
+Funding has a **floor** of 0.00125%/hr (10.95%/yr) from the fixed interest
+component, so a rate sitting exactly on the floor is the venue's mechanical
+baseline, not a directional signal. The momentum model therefore measures
+funding *relative to that floor*: a rate above it leans against the crowded
+side, and at the floor the term is zero. Two regimes matter — at or near the
+floor the edge has to come from price and flow, while a rate well above it is a
+carry cost that a position has to clear. `funding_apr` is stored as a
+**fraction** (0.1095), so any display multiplies by 100 before adding `%`.
+
 ---
 
 ## Install and run
@@ -200,6 +213,7 @@ python -m hlperp paper --seconds 60    # bounded run, useful for CI/smoke
 | `HL_MAINTENANCE_LEVERAGE` | `2.0` | maintenance-margin assumption for liq distance |
 | `HL_MAX_DRAWDOWN_PCT` | `10` | kill-switch threshold |
 | `HL_MIN_LIQ_DISTANCE_PCT` | `15` | refuse orders with liquidation closer than this |
+| `HL_HOLD_SIGNAL` | `0.3` | momentum: below this \|signal\| the model holds instead of trading; `0` disables |
 | `HL_TP_SL` | `false` | arm a reduce-only take-profit / stop-loss bracket |
 | `HL_TP_PCT` / `HL_SL_PCT` | `0.02` / `0.01` | bracket distances from the mark |
 | `HL_INTERVAL` | `2.0` | seconds between decisions |

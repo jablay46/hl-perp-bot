@@ -9,6 +9,22 @@ Side = Literal["buy", "sell"]
 PositionSide = Literal["long", "short", "flat"]
 Action = Literal["buy", "sell", "hold"]
 
+# Hyperliquid's fixed interest component: 0.01% per 8h, charged hourly at one eighth.
+# At P=0 (perp exactly on spot) the funding rate does not go to zero, it lands here,
+# so a long pays roughly 10.95% a year even in a completely flat market. Anything
+# deciding whether a position is worth holding has to price this, not assume zero.
+FUNDING_FLOOR_HOURLY = 0.0001 / 8
+FUNDING_FLOOR_APR = FUNDING_FLOOR_HOURLY * 24 * 365  # ~0.1095, a fraction
+
+
+def funding_apr_pct(apr: float) -> float:
+    """``funding_apr`` is a fraction (0.1095 = 10.95%). This is it as a percentage.
+
+    Every display site goes through here: rendering the fraction with a ``%``
+    suffix printed 0.1% for a 10.95% rate, off by 100x.
+    """
+    return apr * 100.0
+
 
 @dataclass
 class Level:

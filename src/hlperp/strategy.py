@@ -127,16 +127,31 @@ class Strategy:
             allowed=allowed,
         )
 
-    def signal_for(self, decision_action: str, book, sz_decimals: int) -> Signal:
-        """Build the order intent for the model's side."""
+    def signal_for(
+        self,
+        decision_action: str,
+        book,
+        sz_decimals: int,
+        *,
+        reduce_only: bool = False,
+        taker: Optional[bool] = None,
+    ) -> Signal:
+        """Build the order intent for the model's side.
+
+        ``taker`` overrides the configured ``HL_ORDER_TIF`` for one order. An exit
+        passes ``taker=True`` even when entries are resting ALO: a resting exit only
+        fills when the market moves your way, which caps winners at the spread and
+        lets losers run. An entry keeps the configured default, so post-only entries
+        still earn the spread.
+        """
         side = "buy" if decision_action == "buy" else "sell"
         mid = book.mid
         if mid is None:
             # An assert here would vanish under -O and then silently build an order
             # at nan. Raise instead so the caller sees a real failure.
             raise ValueError("signal_for called with a book that has no mid price")
-        half = self.cfg.spread_bps / 10_000
-        if self.cfg.order_tif == "ALO":
+        use_taker = (self.cfg.order_tif != "ALO") if taker is None else taker
+        if not use_taker:
             # Join the near touch on our own side: the best bid for a buy, the
             # best ask for a sell. It is maker (post-only) and, unlike quoting at
             # the mid, it still rests when the spread is a single tick; best levels
@@ -158,9 +173,11 @@ class Strategy:
             px = round_px(px, sz_decimals)
             tif = "ALO"
         else:
-            # Taker: cross the touch.
+            # Taker: cross the touch. `HL_ORDER_TIF` picks the aggressive type for a
+            # configured taker, but an exit that was explicitly marked taker and is
+            # configured ALO still needs a crossing type, so it becomes IOC.
             px = book.best_ask if side == "buy" else book.best_bid
             px = round_px(px or mid, sz_decimals)
-            tif = self.cfg.order_tif
+            tif = self.cfg.order_tif if self.cfg.order_tif != "ALO" else "IOC"
         return Signal(coin=self.cfg.coin, side=side, tif=tif, limit_px=px,
-                      reason=f"model={decision_action}")
+                      reduce_only=reduce_only, reason=f"model={decision_action}")

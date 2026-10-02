@@ -7,7 +7,9 @@ order.
 
 P&L is honest: fees are charged on every fill and funding accrues on open
 notional. That funding term is the part ``jev-trader`` has no concept of and the
-part that decides whether a perp strategy survives.
+part that decides whether a perp strategy survives. Two ideas are borrowed from
+it: ``hold`` is a real answer, so a tick can legitimately send no order, and an
+exit crosses as a taker while an entry rests post-only.
 """
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ from .config import Config
 from .execution import Broker, PaperBroker
 from .market import MarketData
 from .model import Model
-from .risk import RiskEngine
+from .risk import RiskDecision, RiskEngine
+from .rounding import floor_sz
 from .strategy import Strategy
 from .types import AccountState, Fill, MarketState, OrderResult, Position
 
@@ -70,7 +73,7 @@ class Trader:
 
         self.history: list[TEvent] = []
         self.totals = {
-            "ticks": 0, "decisions": 0, "orders": 0, "rejected": 0,
+            "ticks": 0, "decisions": 0, "orders": 0, "rejected": 0, "holds": 0,
             "fills": 0, "fees": 0.0, "funding": 0.0, "realized": 0.0,
             "starting_equity": 0.0, "last_equity": 0.0,
         }
@@ -256,6 +259,7 @@ class Trader:
         # Position caps pick the reducing side only.
         already_long = bool(pos_view and pos_view.side == "long")
         already_short = bool(pos_view and pos_view.side == "short")
+        pos_value = self._position_notional(pos_view, ctx.mark_px)
         cap = equity * self.cfg.max_notional_pct / 100.0
         at_cap = pos_value >= cap
         allowed = {"buy": not halted, "sell": not halted}
@@ -274,6 +278,9 @@ class Trader:
             action = decision.action
             if not allowed.get(action, True):
                 action = "sell" if action == "buy" else "buy"
+            # An exit is the model turning against the open position: reduce-only and
+            # crossing as a taker. An entry keeps the configured post-only default.
+            reduce_only = self._is_exit(action, pos_view)
             decision_dict = {
                 "action": decision.action,
                 "executed_action": action,
@@ -282,36 +289,42 @@ class Trader:
                 "reason": decision.reason,
                 "capped": action != decision.action,
             }
-            sig = self.strategy.signal_for(action, book, self.market.sz_decimals)
-            size_dec = self.risk.size(
-                "buy" if action == "buy" else "sell",
-                self.totals["last_equity"],
-                sig.limit_px,
-                exchange_max_leverage=self.market.max_leverage,
-                current_position=pos_view,
-                sz_decimals=self.market.sz_decimals,
-            )
-            if size_dec.allowed:
-                # The risk engine may flip the side (e.g. an existing long that
-                # needs unwinding); honour the order it actually wants.
-                order_side = size_dec.side or ("buy" if action == "buy" else "sell")
-                if order_side != ("buy" if action == "buy" else "sell"):
-                    sig = self.strategy.signal_for(order_side, book, self.market.sz_decimals)
-                self._cancel_resting()
-                result = self.broker.place(sig, size_dec.size, book.mid, self.market.sz_decimals)
-                self.totals["orders"] += 1
-                if result.status in ("rejected", "error"):
-                    self.totals["rejected"] += 1
-                order_dict = asdict(result)
-                order_dict["risk"] = {
-                    "notional": round(size_dec.notional, 2),
-                    "liq_distance_pct": size_dec.liq_distance_pct,
-                }
-                if result.status == "filled" and result.raw.get("fill"):
-                    self._apply_fill(Fill(**result.raw["fill"]))
+            if decision.action == "hold":
+                # A hold is a real answer, not a skipped tick. Pull any resting quote
+                # so an order the model no longer wants cannot get hit, then do nothing.
+                if self._cancel_resting():
+                    decision_dict["cancelled"] = True
+                self.totals["holds"] += 1
             else:
-                decision_dict["risk_block"] = size_dec.reason
-                self.totals["rejected"] += 1
+                sig = self.strategy.signal_for(
+                    action, book, self.market.sz_decimals,
+                    reduce_only=reduce_only, taker=reduce_only,
+                )
+                size_dec = self._size_for(action, reduce_only, pos_view, sig, mstate)
+                if size_dec.allowed:
+                    # The risk engine may flip the side (e.g. an existing long that
+                    # needs unwinding); honour the order it actually wants.
+                    order_side = size_dec.side or ("buy" if action == "buy" else "sell")
+                    if order_side != ("buy" if action == "buy" else "sell"):
+                        sig = self.strategy.signal_for(
+                            order_side, book, self.market.sz_decimals,
+                            reduce_only=reduce_only, taker=reduce_only,
+                        )
+                    self._cancel_resting()
+                    result = self.broker.place(sig, size_dec.size, book.mid, self.market.sz_decimals)
+                    self.totals["orders"] += 1
+                    if result.status in ("rejected", "error"):
+                        self.totals["rejected"] += 1
+                    order_dict = asdict(result)
+                    order_dict["risk"] = {
+                        "notional": round(size_dec.notional, 2),
+                        "liq_distance_pct": size_dec.liq_distance_pct,
+                    }
+                    if result.status == "filled" and result.raw.get("fill"):
+                        self._apply_fill(Fill(**result.raw["fill"]))
+                else:
+                    decision_dict["risk_block"] = size_dec.reason
+                    self.totals["rejected"] += 1
 
         event = TEvent(
             ts=int(time.time() * 1000),
@@ -364,9 +377,56 @@ class Trader:
     def market_model_decide(self, mstate: MarketState):
         return self.strategy.model.decide(mstate)
 
-    def _cancel_resting(self) -> None:
+    def _is_exit(self, action: str, pos_view) -> bool:
+        """True when ``action`` reduces the open position rather than opening/extending.
+
+        A reduce-only exit is only meaningful when a position exists and the order
+        opposes it; a flat book makes every order an entry.
+        """
+        if pos_view is None or pos_view.size <= 0:
+            return False
+        return (pos_view.side == "long" and action == "sell") or (
+            pos_view.side == "short" and action == "buy"
+        )
+
+    def _position_notional(self, pos_view, mark_px: float) -> float:
+        """Mark value of the open position, using the mark rather than a raw price."""
+        if pos_view is None or pos_view.size <= 0:
+            return 0.0
+        return abs(pos_view.size) * (mark_px or pos_view.entry_px)
+
+    def _size_for(self, action: str, reduce_only: bool, pos_view, sig, mstate: MarketState) -> RiskDecision:
+        """Size an exit as a full reduce-only flatten, otherwise as a normal entry.
+
+        A partial reduce is not what "exit" means here: the model said the side is
+        wrong, so the whole position comes off. Sizing it through the entry target
+        would leave a stub open that the next tick has to deal with. The reduce is
+        clamped to the position so the venue cannot reject it as over-reducing.
+        """
+        if reduce_only:
+            size = floor_sz(pos_view.size, self.market.sz_decimals)
+            if size <= 0:
+                return RiskDecision(False, 0.0, "exit size rounds to 0 at the asset's lot size")
+            return RiskDecision(
+                True, size, "reduce-only exit", side=sig.side,
+                notional=abs(size * sig.limit_px),
+            )
+        return self.risk.size(
+            "buy" if action == "buy" else "sell",
+            self.totals["last_equity"],
+            sig.limit_px,
+            exchange_max_leverage=self.market.max_leverage,
+            current_position=pos_view,
+            sz_decimals=self.market.sz_decimals,
+        )
+
+    def _cancel_resting(self) -> bool:
+        """Pull every resting order. Returns whether anything was actually cancelled."""
+        cancelled = False
         for o in self.broker.open_orders(self.cfg.coin):
             self.broker.cancel(self.cfg.coin, o.oid)
+            cancelled = True
+        return cancelled
 
     def _equity(self, state: AccountState, mark_px: float) -> float:
         if isinstance(self.broker, PaperBroker):
@@ -386,6 +446,7 @@ class Trader:
             "decisions": self.totals["decisions"],
             "orders": self.totals["orders"],
             "rejected": self.totals["rejected"],
+            "holds": self.totals["holds"],
             "fills": self.totals["fills"],
             "fees": round(self.totals["fees"], 6),
             "funding": round(self.totals["funding"], 6),

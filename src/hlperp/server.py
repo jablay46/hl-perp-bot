@@ -63,7 +63,7 @@ es.onmessage=(e)=>{const m=JSON.parse(e.data);
 function fmt(x,d=2){return x==null?'-':Number(x).toFixed(d);}
 function render(e){
  mid.textContent=fmt(e.mid,1);spread.textContent=fmt(e.spread_bps,2);
- funding.textContent=fmt(e.funding_apr,1)+'%';
+ funding.textContent=fmt(e.funding_apr*100,1)+'%';
  const p=e.position||{};pos.textContent=(p.side||'flat')+' '+fmt(p.size,4);
  pos.className='v '+(p.side==='long'?'buy':p.side==='short'?'sell':'');
  const t=e.totals||{};equity.textContent=fmt(t.equity,2);pnl.textContent=fmt(t.pnl_pct,3)+'%';
