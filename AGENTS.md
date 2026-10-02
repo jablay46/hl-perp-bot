@@ -120,3 +120,43 @@ is required (or install the package editable).
   the remainder keeps its original entry and only the closed size realizes PnL.
 - **Never `assert` a market invariant** (`signal_for` mid). Asserts are stripped
   under `-O` and the code then builds an order at `nan`. Raise instead.
+
+## Funding, hold, and exits
+
+- **`funding_apr` is a fraction, not a percent.** It is the hourly rate
+  annualised (`funding_hourly * 24 * 365`), so the floor is `0.1095`, not
+  `10.95`. Every display must multiply by 100 before appending `%`; use
+  `funding_apr_pct` rather than doing it by hand. Rendering the raw fraction with
+  a `%` suffix under-reports by 100x, which is how a 10.95% rate once showed as
+  `0.1%` in both `cli.py` and `server.py`.
+- **Funding has a venue floor of 0.00125%/hr (10.95%/yr)**, the fixed interest
+  component. A rate sitting exactly on the floor is mechanical, not directional:
+  the live BTC market reads `0.0000125`/hr for long stretches. Any funding signal
+  must be measured *relative to the floor* (`FUNDING_FLOOR_HOURLY`), or it fires
+  on a flat market.
+- **Carry tilts, it does not decide.** `_FUNDING_CARRY_WEIGHT` is calibrated so
+  funding alone cannot force a side in a flat market. A weight that is too large
+  makes the bot a one-way funding trade wearing a momentum label.
+- **`hold` is a real action**, not a skipped tick. It sends no order and cancels
+  the standing quote. The band is `HL_HOLD_SIGNAL` (default `0.3`; `0` disables).
+  An unreadable LLM `action` must fall back to the probability, never to `hold`,
+  or a garbled reply silently stops trading forever.
+- **Entries rest post-only; exits are reduce-only and cross as taker.** With
+  `HL_ORDER_TIF=ALO` an exit routed through the normal path can never fill. The
+  exit is a full flatten clamped to the position, deliberately bypassing the
+  entry-target sizing, because routing it through the target leaves a stub open.
+- **`PaperBroker.on_print` matches on price, not the aggressor.** A test that
+  passes `is_buy` expecting it to matter is wrong; the unreachable price depends
+  on the resting quote's own side. Paper fills are also fractional, so a position
+  can end a sub-lot remainder below the $10 minimum that no order can close.
+
+## Opening a PR in this repo
+
+- **`GITHUB_TOKEN` is a GitHub App token without pull-request write.** `gh pr
+  create` and `POST /pulls` both return `403 Resource not accessible by
+  integration`; the `create_pr` tool fails the same way. Use `GITHUB_ACCESS`
+  (classic PAT, `repo` scope) for PR creation. Push works with `GITHUB_TOKEN`.
+- After a PR merges, branch the next change from the updated `main` (or
+  cherry-pick onto it) rather than reusing the merged branch, so the new PR does
+  not carry commits that are already in `main`.
+
