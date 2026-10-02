@@ -37,11 +37,12 @@ def _cfg(monkeypatch, **env):
 
 def test_tick_produces_decision_and_order(monkeypatch):
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
-               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
     market = FakeMarket()
     events = []
     trader = Trader(cfg, market, Account("testnet", None), PaperBroker("BTC"),
-                    MomentumModel(), on_event=events.append)
+                    MomentumModel(min_signal=0), on_event=events.append)
     e = trader.tick()
     assert e is not None
     assert e.decision is not None
@@ -55,32 +56,39 @@ def test_tick_produces_decision_and_order(monkeypatch):
 
 def test_crossing_print_fills_resting_maker_and_updates_pnl(monkeypatch):
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
-               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
     market = FakeMarket()
     broker = PaperBroker("BTC")
-    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
     trader.tick()
     assert len(broker.open_orders("BTC")) == 1
     resting = broker.open_orders("BTC")[0]
-    # A seller hits our resting bid: a market sell print at our price.
+    # PaperBroker matches on price, not on the aggressor: a print at the quote's own
+    # price reaches it whichever side the model chose to rest.
     n_before = trader.totals["fills"]
-    trader.on_print("BTC", resting.px, int(time.time() * 1000), is_buy=False)
+    trader.on_print("BTC", resting.px, int(time.time() * 1000), is_buy=resting.side == "buy")
     assert trader.totals["fills"] > n_before
     assert trader.totals["fees"] > 0
-    assert broker.position("BTC").size > 0
+    assert broker.position("BTC").size != 0
 
 
 def test_wrong_side_print_does_not_fill(monkeypatch):
-    """A print that does not reach our resting bid must not fill it."""
+    """A print that does not reach our resting quote must not fill it.
+
+    Matching is price-based, so the unreachable price depends on the quote's side:
+    a print above a resting bid, or below a resting ask, is the wrong side.
+    """
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
-               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
     market = FakeMarket()
     broker = PaperBroker("BTC")
-    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
     trader.tick()
     resting = broker.open_orders("BTC")[0]
-    # A print above our resting bid never fills a bid.
-    trader.on_print("BTC", resting.px + 1.0, int(time.time() * 1000), is_buy=True)
+    away = resting.px + 1.0 if resting.side == "buy" else resting.px - 1.0
+    trader.on_print("BTC", away, int(time.time() * 1000), is_buy=False)
     assert trader.totals["fills"] == 0
     assert broker.position("BTC").size == 0
 
@@ -88,10 +96,11 @@ def test_wrong_side_print_does_not_fill(monkeypatch):
 def test_risk_blocks_order_when_liquidation_too_close(monkeypatch):
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_LEVERAGE=10,
                HL_MAX_LEVERAGE=10, HL_MAINTENANCE_LEVERAGE=10,
-               HL_MIN_LIQ_DISTANCE_PCT=15, HL_MAX_DRAWDOWN_PCT=99)
+               HL_MIN_LIQ_DISTANCE_PCT=15, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
     market = FakeMarket()
     broker = PaperBroker("BTC")
-    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
     trader.tick()
     assert len(broker.open_orders("BTC")) == 0
     assert trader.totals["rejected"] >= 1
@@ -116,17 +125,20 @@ def test_kill_switch_halts_and_stops_ordering(monkeypatch):
 
 def test_funding_accrues_on_open_position(monkeypatch):
     cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
-               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99)
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
     market = FakeMarket()
     broker = PaperBroker("BTC")
-    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel())
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
     trader.tick()
     resting = broker.open_orders("BTC")[0]
-    trader.on_print("BTC", resting.px - 0.01, int(time.time() * 1000), is_buy=False)
-    assert broker.position("BTC").size > 0
+    trader.on_print("BTC", resting.px, int(time.time() * 1000), is_buy=resting.side == "buy")
+    assert broker.position("BTC").size != 0
     trader._last_funding_ts -= 3_600_000  # simulate an hour passing
     trader.tick()
-    assert trader.totals["funding"] > 0
+    # Longs pay positive funding, shorts receive it, so the sign follows the side.
+    pos = broker.position("BTC")
+    assert trader.totals["funding"] * (1.0 if pos.size > 0 else -1.0) > 0
 
 
 def test_totals_view_flags_unfunded_account(monkeypatch):
@@ -282,4 +294,123 @@ def test_signal_for_raises_instead_of_asserting_on_missing_mid(monkeypatch):
         assert "mid" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError")
+
+
+
+# -- hold, and the post-only entry / taker exit split -------------------------
+
+class _AlwaysHold:
+    """A model that always holds, so the no-order path can be tested directly."""
+
+    name = "hold"
+
+    def decide(self, state):
+        from hlperp.types import Decision
+
+        return Decision(action="hold", probabilities={"buy": 0.5, "sell": 0.5, "hold": 1.0},
+                        up=0.5, latency_ms=0.0, input_tokens=0, reason="test hold")
+
+
+def test_hold_sends_no_order_and_pulls_a_resting_quote(monkeypatch):
+    """A hold is a real answer: it must not order, and must cancel what it no longer wants."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
+    trader.tick()
+    assert len(broker.open_orders("BTC")) == 1  # a quote is resting
+
+    trader.strategy.model = _AlwaysHold()
+    e = trader.tick()
+    assert e.decision["action"] == "hold"
+    assert e.order is None
+    assert trader.totals["orders"] == 1  # unchanged by the hold
+    assert trader.totals["holds"] == 1
+    assert len(broker.open_orders("BTC")) == 0  # the standing quote was pulled
+    assert e.decision.get("cancelled") is True
+
+
+def test_hold_with_nothing_resting_is_not_a_cancellation(monkeypatch):
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99, HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, _AlwaysHold())
+    e = trader.tick()
+    assert e.order is None
+    assert trader.totals["holds"] == 1
+    assert "cancelled" not in e.decision
+
+
+def test_exit_is_reduce_only_and_crosses_as_taker(monkeypatch):
+    """An entry rests post-only; the exit that closes it must be reduce-only and IOC."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
+    trader.tick()
+    entry = broker.open_orders("BTC")[0]
+    trader.on_print("BTC", entry.px, int(time.time() * 1000), is_buy=entry.side == "buy")
+    pos = broker.position("BTC")
+    assert pos.size != 0
+    entry_side = "buy" if pos.size > 0 else "sell"
+
+    class _Against:
+        name = "against"
+
+        def decide(self, state):
+            from hlperp.types import Decision
+
+            against = "sell" if entry_side == "buy" else "buy"
+            return Decision(action=against, probabilities={"buy": 0.1, "sell": 0.9, "hold": 0.0},
+                            up=0.1, latency_ms=0.0, input_tokens=0, reason="flip")
+
+    trader.strategy.model = _Against()
+    trader.tick()
+    assert trader.totals["orders"] == 2
+    assert len(broker.open_orders("BTC")) == 0  # crossed as a taker, nothing rests
+    # The exit removed the position down to at most one lot of dust. A live venue
+    # always reports a lot-aligned position, so the remainder is a paper artifact of
+    # the broker's fractional partial fills, and it sits below the $10 venue minimum
+    # so it cannot be closed by any order.
+    assert abs(broker.position("BTC").size) < 0.01
+
+
+def test_exit_never_sizes_above_the_open_position(monkeypatch):
+    """A reduce-only exit is clamped to the position so the venue cannot reject it."""
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO",
+               HL_SPREAD_BPS=2, HL_MIN_LIQ_DISTANCE_PCT=0, HL_MAX_DRAWDOWN_PCT=99,
+               HL_HOLD_SIGNAL=0)
+    market = FakeMarket()
+    broker = PaperBroker("BTC")
+    trader = Trader(cfg, market, Account("testnet", None), broker, MomentumModel(min_signal=0))
+    trader.tick()
+    entry = broker.open_orders("BTC")[0]
+    trader.on_print("BTC", entry.px, int(time.time() * 1000), is_buy=entry.side == "buy")
+    pos = broker.position("BTC")
+    action = "sell" if pos.size > 0 else "buy"
+    sig = trader.strategy.signal_for(action, market.book, 2, reduce_only=True, taker=True)
+    pos_view, _ = trader._position_view(AccountState(0.0, 0.0, 0.0, 0.0, None))
+    dec = trader._size_for(action, True, pos_view, sig, None)
+    assert dec.allowed
+    assert dec.size <= abs(pos.size) + 1e-12
+
+
+def test_signal_for_taker_override_ignores_the_alo_default(monkeypatch):
+    """With HL_ORDER_TIF=ALO an explicit taker still crosses, because ALO cannot fill."""
+    from hlperp.strategy import Strategy
+
+    cfg = _cfg(monkeypatch, HL_COIN="BTC", HL_MODE="paper", HL_ORDER_TIF="ALO")
+    market = FakeMarket()
+    strat = Strategy(cfg, market, MomentumModel())
+    resting = strat.signal_for("buy", market.book, 2)
+    crossing = strat.signal_for("buy", market.book, 2, reduce_only=True, taker=True)
+    assert resting.tif == "ALO" and crossing.tif == "IOC"
+    assert resting.limit_px < market.book.best_ask  # never crosses
+    assert crossing.limit_px >= market.book.best_ask  # crosses the touch
+    assert crossing.reduce_only is True and resting.reduce_only is False
 

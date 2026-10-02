@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from typing import Optional, Protocol
 
-from .types import Decision, MarketState
+from .types import FUNDING_FLOOR_HOURLY, Decision, MarketState
 
 log = logging.getLogger("hlperp.model")
 
@@ -34,22 +34,67 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, x))))
 
 
+# Signal units per basis point of funding above the floor. Calibrated so the term is
+# zero at the floor, comparable to the old constant near typical funding, and only
+# large enough to cross the hold threshold in a genuinely stressed regime. Carry is a
+# cost to clear, not a standalone directional edge: it tilts a decision, it does not
+# by itself open a position.
+_FUNDING_CARRY_WEIGHT = 0.06
+
+
+def _funding_carry(state: MarketState) -> float:
+    """Funding as a carry signal, not a constant long bias.
+
+    Hyperliquid floors the rate at :data:`FUNDING_FLOOR_HOURLY`, so a long pays
+    roughly 10.95% a year even when the perp sits exactly on spot. At the floor the
+    rate is a mechanical constant that carries no directional information, so it must
+    not push a side. Above it the excess is the crowd: a positive excess means longs
+    are paying up, a negative one means shorts are, and the paid side is the crowded
+    one, so the signal leans against it.
+    """
+    excess = state.funding_hourly - FUNDING_FLOOR_HOURLY
+    return -excess * 10_000.0 * _FUNDING_CARRY_WEIGHT
+
+
 class MomentumModel:
-    """Momentum + book imbalance + taker flow, pulled toward flat."""
+    """Momentum + book imbalance + taker flow + funding carry, pulled toward flat.
+
+    ``min_signal`` is the conviction below which the model holds instead of paying a
+    spread and two taker fees for an edge too small to cover them. Hold is a real
+    answer here, as it is in ``jev-trader``; a tick with no order is not a skipped tick.
+    """
 
     name = "momentum"
+
+    def __init__(self, min_signal: float = 0.3) -> None:
+        self.min_signal = min_signal
 
     def decide(self, state: MarketState) -> Decision:
         t0 = time.perf_counter()
         r = state.returns_bps
         flow = state.trades.get("cvd_ratio") or 0.0
+        carry = _funding_carry(state)
         signal = (
             r.get("last20", 0.0) / 6.0
             + state.book_imbalance * 0.8
             + float(flow) * 1.0
-            + (state.funding_apr / 100.0) * 0.5
+            + carry
         )
         up = _sigmoid(signal)
+        reason = (
+            f"mom20={r.get('last20', 0):.2f}bps imb={state.book_imbalance:.2f} "
+            f"flow={flow:.2f} carry={carry:+.3f}"
+        )
+        if abs(signal) < self.min_signal:
+            # Fees and spread are certain, the edge is not. Stand down.
+            return Decision(
+                action="hold",
+                probabilities={"buy": up, "sell": 1 - up, "hold": 1.0},
+                up=up,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                input_tokens=len(state.recent_mids) // 4,
+                reason=f"hold: |{signal:+.2f}| < {self.min_signal} {reason}",
+            )
         action = "buy" if up >= 0.5 else "sell"
         return Decision(
             action=action,
@@ -57,20 +102,24 @@ class MomentumModel:
             up=up,
             latency_ms=(time.perf_counter() - t0) * 1000,
             input_tokens=len(state.recent_mids) // 4,
-            reason=f"mom20={r.get('last20', 0):.2f}bps imb={state.book_imbalance:.2f} flow={flow:.2f}",
+            reason=reason,
         )
 
 
 _SYSTEM = (
     "You are a disciplined perpetual futures trader on Hyperliquid. You answer "
-    "one question per tick with a probability, nothing else. Funding and "
-    "liquidation risk matter: a position held across a high funding rate bleeds."
+    "one question per tick with a probability, nothing else. Funding settles hourly "
+    "on this venue and does not fall to zero in a flat market: a long pays roughly "
+    "10.95% a year even with the perp on spot, and a position held across a high "
+    "funding rate bleeds faster than most traders assume. 'hold' is a valid answer "
+    "when the edge does not cover fees, spread and funding."
 )
 
 _JSON_HINT = (
     'Answer ONLY with JSON: {"up": <float 0..1>, "reason": "<short>"} where "up" is '
     "the probability the mid is higher after the horizon. Above 0.5 means long, "
-    "below 0.5 means short."
+    'below 0.5 means short. Add "action": "hold" when the edge does not cover fees, '
+    "spread and funding."
 )
 
 
@@ -173,9 +222,13 @@ class OpenAIModel:
                 parsed = _extract_json(content)
                 up = max(0.0, min(1.0, float(parsed["up"])))
                 usage = body.get("usage", {}).get("prompt_tokens", 0)
+                # "hold" is only taken when the model asks for it explicitly; an
+                # unreadable or absent action still trades on `up` rather than
+                # silently flattening to a hold.
+                asked_hold = str(parsed.get("action", "")).strip().lower() == "hold"
                 return Decision(
-                    action="buy" if up >= 0.5 else "sell",
-                    probabilities={"buy": up, "sell": 1 - up, "hold": 0.0},
+                    action="hold" if asked_hold else ("buy" if up >= 0.5 else "sell"),
+                    probabilities={"buy": up, "sell": 1 - up, "hold": 1.0 if asked_hold else 0.0},
                     up=up,
                     latency_ms=(time.perf_counter() - t0) * 1000,
                     input_tokens=int(usage),
@@ -214,4 +267,4 @@ def create_model(cfg) -> Model:
             json_mode=cfg.llm_json_mode, extra_headers=headers,
             max_retries=cfg.llm_max_retries, retry_base_s=cfg.llm_retry_base_s,
         )
-    return MomentumModel()
+    return MomentumModel(min_signal=cfg.hold_signal)

@@ -27,6 +27,7 @@ from .risk import (
 )
 from .server import Server
 from .trader import Trader
+from .types import funding_apr_pct
 
 
 def _setup_logging() -> None:
@@ -79,7 +80,7 @@ def cmd_doctor(cfg) -> int:
         print(f"book         bid={book.best_bid} ask={book.best_ask} mid={book.mid} "
               f"spread={book.spread_bps:.2f}bps")
         print(f"ctx          mark={ctx.mark_px} oracle={ctx.oracle_px} "
-              f"funding_hourly={ctx.funding_hourly} funding_apr={ctx.funding_apr:.2f}%")
+              f"funding_hourly={ctx.funding_hourly} funding_apr={funding_apr_pct(ctx.funding_apr):.2f}%")
     except Exception as exc:
         ok = False
         print(f"market data  FAILED: {exc}")

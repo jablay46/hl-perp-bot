@@ -257,3 +257,116 @@ def test_llm_check_exit_codes(monkeypatch, capsys):
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
     assert cmd_llm_check(load_config(), 1) == 1
     assert "every call failed" in capsys.readouterr().out
+
+
+# -- funding units, the floor, and the two funding regimes --------------------
+
+def test_funding_apr_is_a_fraction_and_display_scales_it():
+    """funding_apr is a fraction, so a display must multiply by 100.
+
+    Rendering the fraction with a '%' suffix printed 0.1% for a 10.95% rate, off by
+    100x, at every display site.
+    """
+    from hlperp.types import FUNDING_FLOOR_APR, funding_apr_pct
+
+    assert abs(FUNDING_FLOOR_APR - 0.1095) < 1e-9
+    assert abs(funding_apr_pct(FUNDING_FLOOR_APR) - 10.95) < 1e-9
+    # The live venue reads exactly the floor, so this is not a hypothetical value.
+    assert abs(funding_apr_pct(0.0000125 * 24 * 365) - 10.95) < 1e-6
+
+
+def _funding_state(hourly: float):
+    from hlperp.types import MarketState
+
+    return MarketState(
+        coin="BTC", ts=0, mid=100.0, mark_px=100.0, oracle_px=100.0, spread_bps=1.0,
+        funding_hourly=hourly, funding_apr=hourly * 24 * 365, open_interest=1.0,
+        day_ntl_vlm=1e6, book_imbalance=0.0, depth_usd={},
+        returns_bps={"last1": 0.0, "last5": 0.0, "last20": 0.0, "last100": 0.0},
+        recent_mids="100", trades={"cvd_ratio": 0.0}, recent_trades=[],
+        position_side="flat", position_size=0.0, unrealized_pnl=0.0,
+        account_value=10_000.0, allowed={"buy": True, "sell": True},
+    )
+
+
+def test_funding_at_the_floor_is_not_a_directional_signal():
+    """At the floor funding is a mechanical constant, so it must not pick a side.
+
+    The old term was a constant long bias even with a perfectly flat market, which is
+    wrong twice over: it fired at the floor, and its magnitude was 100x off.
+    """
+    from hlperp.model import _funding_carry
+
+    assert abs(_funding_carry(_funding_state(0.0001 / 8))) < 1e-12
+
+
+def test_funding_above_the_floor_leans_against_the_crowded_side():
+    from hlperp.model import _funding_carry
+
+    crowded_long = _funding_carry(_funding_state(0.0003))
+    crowded_short = _funding_carry(_funding_state(-0.0002))
+    assert crowded_long < 0  # longs paying up, so the tilt is short
+    assert crowded_short > 0  # shorts paying up, so the tilt is long
+
+
+def test_momentum_holds_when_the_edge_does_not_cover_costs():
+    """A quiet book with funding at the floor is not worth a round trip."""
+    from hlperp.model import MomentumModel
+
+    d = MomentumModel(min_signal=0.3).decide(_funding_state(0.0001 / 8))
+    assert d.action == "hold"
+    assert d.probabilities["hold"] == 1.0
+    assert "hold" in d.reason
+
+
+def test_momentum_trades_when_the_signal_is_real():
+    from hlperp.model import MomentumModel
+
+    state = _funding_state(0.0001 / 8)
+    state.returns_bps = {"last1": 0.0, "last5": 0.0, "last20": 60.0, "last100": 60.0}
+    d = MomentumModel(min_signal=0.3).decide(state)
+    assert d.action == "buy"
+    assert d.probabilities["hold"] == 0.0
+
+
+def test_hold_signal_zero_disables_the_band():
+    from hlperp.model import MomentumModel
+
+    d = MomentumModel(min_signal=0.0).decide(_funding_state(0.0001 / 8))
+    assert d.action in ("buy", "sell")
+
+
+def test_openai_model_honours_an_explicit_hold():
+    """An LLM that asks for a hold must not be turned into a trade."""
+    base, httpd = _serve({"choices": [{"message": {
+        "content": '{"up": 0.8, "action": "hold", "reason": "edge too small"}'}}]})
+    try:
+        m = OpenAIModel("k", base, "some:free", horizon=60)
+        d = m.decide(_state())
+        assert d.action == "hold"
+        assert d.probabilities["hold"] == 1.0
+        assert not d.reason.startswith("fallback:")
+    finally:
+        httpd.shutdown()
+
+
+def test_openai_model_ignores_an_unreadable_action_and_still_trades():
+    """A garbled action must not silently become a hold, which would stop trading."""
+    base, httpd = _serve({"choices": [{"message": {
+        "content": '{"up": 0.9, "action": "HOLD!!", "reason": "?"}'}}]})
+    try:
+        m = OpenAIModel("k", base, "some:free", horizon=60)
+        d = m.decide(_state())
+        assert d.action == "buy"
+        assert d.probabilities["hold"] == 0.0
+    finally:
+        httpd.shutdown()
+
+
+def test_momentum_fallback_still_answers_on_a_bad_endpoint():
+    """The deterministic fallback must keep the hold band, not bypass it."""
+    from hlperp.model import MomentumModel
+
+    d = MomentumModel(min_signal=0.3).decide(_funding_state(0.0001 / 8))
+    assert d.action == "hold"
+
